@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""Bilibili Dynamic Image Archiver — collects, compresses, and uploads to Cloudflare R2.
+
+Data flow:
+  1. Load manifest from R2 (current.json) as old baseline
+  2. Fetch Bilibili user dynamics via API (paginated)
+  3. Extract dynamics that contain images
+  4. Download original images, compress (1/3 width, q35 JPEG), upload to R2
+  5. Generate index.json + search-index.json + new manifest
+  6. Upload manifests/current.json, then delete stale R2 objects from old manifest
+
+On failure before step 6 completes, the previous index.json remains intact → no broken site.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import boto3
+import requests
+from botocore.config import Config
+from PIL import Image, UnidentifiedImageError
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
+R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
+R2_BUCKET = os.environ["R2_BUCKET"]
+R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
+R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+BILIBILI_COOKIE = os.environ.get("BILIBILI_COOKIE", "")
+BILIBILI_UID = os.environ["BILIBILI_UID"]
+KEEP_RECENT = int(os.environ.get("KEEP_RECENT", "10"))
+
+DISPLAY_WIDTH_SCALE = 3
+JPEG_QUALITY = 35
+MAX_API_PAGES = 20
+
+MANIFEST_CURRENT_KEY = "manifests/current.json"
+MANIFEST_PREVIOUS_KEY = "manifests/previous.json"
+INDEX_KEY = "site/index.json"
+SEARCH_INDEX_KEY = "site/search-index.json"
+
+# ---------------------------------------------------------------------------
+# R2 client
+# ---------------------------------------------------------------------------
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=R2_ENDPOINT,
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    config=Config(region_name="auto", retries={"max_attempts": 3, "mode": "standard"}),
+)
+
+# ---------------------------------------------------------------------------
+# R2 helpers
+# ---------------------------------------------------------------------------
+
+def r2_get_json(key: str) -> Optional[dict]:
+    """Fetch and parse a JSON object from R2. Returns None if not found."""
+    try:
+        resp = s3.get_object(Bucket=R2_BUCKET, Key=key)
+        return json.loads(resp["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return None
+    except Exception as exc:
+        log(f"  WARN: Failed to read {key}: {exc}")
+        return None
+
+
+def r2_put_json(key: str, data: Any, cache_max_age: int = 300) -> None:
+    """Upload a JSON-serialisable object to R2."""
+    body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=key,
+        Body=body,
+        ContentType="application/json; charset=utf-8",
+        CacheControl=f"public, max-age={cache_max_age}",
+    )
+
+
+def r2_put_image(key: str, data: bytes) -> None:
+    """Upload a JPEG image to R2 with long-lived cache."""
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=key,
+        Body=data,
+        ContentType="image/jpeg",
+        CacheControl="public, max-age=31536000, immutable",
+    )
+
+
+def r2_delete(key: str) -> bool:
+    """Delete a single object from R2. Returns True on success."""
+    try:
+        s3.delete_object(Bucket=R2_BUCKET, Key=key)
+        return True
+    except Exception as exc:
+        log(f"    WARN: Failed to delete {key}: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Bilibili API
+# ---------------------------------------------------------------------------
+
+BILI_HEADERS_TEMPLATE: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+
+def _bili_headers() -> dict[str, str]:
+    h = dict(BILI_HEADERS_TEMPLATE)
+    h["Referer"] = f"https://space.bilibili.com/{BILIBILI_UID}/dynamic"
+    if BILIBILI_COOKIE:
+        h["Cookie"] = BILIBILI_COOKIE
+    return h
+
+
+def fetch_dynamics() -> list[dict]:
+    """Paginate through the user's dynamic feed and return raw items."""
+    all_items: list[dict] = []
+    offset = ""
+    page = 0
+
+    while page < MAX_API_PAGES:
+        page += 1
+        params = f"host_mid={BILIBILI_UID}&offset={offset}&features=itemOpusStyle"
+        url = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?{params}"
+        log(f"  Page {page}  offset={offset[:32] if offset else '(initial)'}")
+
+        try:
+            resp = requests.get(url, headers=_bili_headers(), timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as exc:
+            log(f"  ERROR: API request failed: {exc}")
+            break
+
+        code = data.get("code")
+        if code != 0:
+            log(f"  API returned code={code} message={data.get('message', '')}")
+            if code == -352:
+                log("  ERROR: Captcha / risk-control triggered — cookie may be invalid.")
+            break
+
+        page_data = data.get("data", {})
+        items = page_data.get("items") or []
+        if not items:
+            log("  No more items.")
+            break
+
+        all_items.extend(items)
+
+        has_more = page_data.get("has_more", False)
+        if not has_more:
+            log("  has_more=false, stopping pagination.")
+            break
+
+        next_offset = page_data.get("offset", "")
+        if not next_offset or next_offset == offset:
+            log("  Offset did not advance, stopping.")
+            break
+        offset = next_offset
+
+    return all_items
+
+
+# ---------------------------------------------------------------------------
+# Data extraction
+# ---------------------------------------------------------------------------
+
+_TAG_RE = re.compile(r"#(\S+?)#")
+
+
+def extract_tags(text: str) -> list[str]:
+    return _TAG_RE.findall(text)
+
+
+def strip_tags(text: str) -> str:
+    return _TAG_RE.sub("", text).strip()
+
+
+def extract_dynamic(item: dict) -> Optional[dict]:
+    """Convert a raw Bilibili dynamic item into our internal format.
+    Returns None if the dynamic has no usable images."""
+    modules = item.get("modules", {})
+    mod_dyn = modules.get("module_dynamic", {})
+    mod_auth = modules.get("module_author", {})
+
+    dyn_id = item.get("id_str", "")
+    if not dyn_id:
+        return None
+
+    pub_ts = mod_auth.get("pub_ts", 0)
+    pub_time = mod_auth.get("pub_time", "")
+    if not pub_ts:
+        return None
+
+    desc = mod_dyn.get("desc", {})
+    raw_text = desc.get("text", "") or ""
+
+    major = mod_dyn.get("major", {})
+    major_type = major.get("type", "")
+
+    image_urls: list[str] = []
+
+    if major_type == "MAJOR_TYPE_DRAW":
+        for it in major.get("draw", {}).get("items", []):
+            src = it.get("src", "")
+            if src:
+                image_urls.append(src)
+
+    elif major_type == "MAJOR_TYPE_OPUS":
+        for pic in major.get("opus", {}).get("pics", []):
+            url = pic.get("url", "")
+            if url:
+                image_urls.append(url)
+
+    if not image_urls:
+        return None
+
+    tags = extract_tags(raw_text)
+    first_line = raw_text.split("\n")[0].strip()
+    title = strip_tags(first_line)
+    if not title and raw_text:
+        title = strip_tags(raw_text[:80]).strip()
+
+    return {
+        "id": dyn_id,
+        "timestamp": pub_ts,
+        "date": pub_time,
+        "text": title,
+        "fullText": raw_text,
+        "bilibiliUrl": f"https://t.bilibili.com/{dyn_id}",
+        "tags": tags,
+        "imageUrls": image_urls,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Image processing
+# ---------------------------------------------------------------------------
+
+IMG_DL_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.bilibili.com/",
+}
+
+
+def download_image(url: str) -> Optional[bytes]:
+    """Download raw image bytes from the given URL."""
+    clean_url = re.sub(r"@\d+w.*$", "", url)  # strip Bilibili size suffix for max res
+    try:
+        resp = requests.get(clean_url, headers=IMG_DL_HEADERS, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as exc:
+        log(f"      Download error: {exc}")
+        return None
+
+
+def compress_image(raw: bytes) -> Optional[tuple[bytes, dict]]:
+    """Compress a JPEG image: convert to RGB, resize width to 1/3, save progressive q35.
+    Returns (compressed_bytes, metadata_dict) or None on failure."""
+    try:
+        img = Image.open(io.BytesIO(raw))
+        original_w, original_h = img.size
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        stored_w = round(original_w / DISPLAY_WIDTH_SCALE)
+        if stored_w < 1:
+            stored_w = 1
+        stored_h = original_h
+
+        if stored_w < original_w:
+            img = img.resize((stored_w, stored_h), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(
+            buf,
+            format="JPEG",
+            quality=JPEG_QUALITY,
+            optimize=True,
+            progressive=True,
+            subsampling="4:2:0",
+        )
+        compressed = buf.getvalue()
+
+        meta = {
+            "originalWidth": original_w,
+            "originalHeight": original_h,
+            "storedWidth": stored_w,
+            "storedHeight": stored_h,
+            "displayWidthScale": DISPLAY_WIDTH_SCALE,
+            "compressionMode": "horizontal-downsample-x0333-q35",
+        }
+        return compressed, meta
+
+    except UnidentifiedImageError:
+        log("      Not a recognised image format, skipping.")
+        return None
+    except Exception as exc:
+        log(f"      Compression error: {exc}")
+        traceback.print_exc()
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    log("=" * 60)
+    log("Bilibili Dynamic Archiver — Cloudflare R2 edition")
+    log(f"  UID        : {BILIBILI_UID}")
+    log(f"  KEEP_RECENT: {KEEP_RECENT}")
+    log(f"  R2 bucket  : {R2_BUCKET}")
+    log("=" * 60)
+
+    # ---- 1. Load previous state ---------------------------------------------
+    log("[Step 1] Loading previous state...")
+    old_manifest = r2_get_json(MANIFEST_CURRENT_KEY)
+    old_objects: set[str] = set()
+    old_index: Optional[dict] = None
+    if old_manifest:
+        old_objects = set(old_manifest.get("objects", []))
+        log(f"  Found previous manifest with {len(old_objects)} objects.")
+
+    # Load previous index.json to recover metadata for already-uploaded images
+    old_index = r2_get_json(INDEX_KEY)
+    old_dynamics_map: dict[str, dict] = {}
+    old_images_map: dict[str, dict] = {}  # r2_key → image metadata
+    if old_index:
+        for od in old_index.get("dynamics", []):
+            old_dynamics_map[od.get("id", "")] = od
+            for oi in od.get("images", []):
+                old_images_map[oi.get("r2Key", "")] = oi
+        log(f"  Loaded old index with {len(old_dynamics_map)} dynamics for metadata recovery.")
+    else:
+        log("  No previous index.json (first run).")
+
+    # ---- 2. Fetch dynamics ---------------------------------------------------
+    log("[Step 2] Fetching Bilibili dynamics...")
+    raw_items = fetch_dynamics()
+    log(f"  Fetched {len(raw_items)} raw items total.")
+
+    # ---- 3. Extract candidates -----------------------------------------------
+    log("[Step 3] Extracting dynamics with images...")
+    candidates: list[dict] = []
+    for item in raw_items:
+        info = extract_dynamic(item)
+        if info:
+            candidates.append(info)
+
+    candidates.sort(key=lambda d: d["timestamp"], reverse=True)
+    selected = candidates[:KEEP_RECENT]
+    log(f"  Candidates with images: {len(candidates)}")
+    log(f"  Selected (top {KEEP_RECENT}): {len(selected)}")
+
+    if not selected:
+        log("WARNING: No image-containing dynamics found. Aborting to preserve existing index.")
+        sys.exit(0)
+
+    # ---- 4. Download, compress & upload images --------------------------------
+    log("[Step 4] Processing images...")
+    dynamics_data: list[dict] = []
+    tracked_objects: set[str] = {
+        INDEX_KEY,
+        SEARCH_INDEX_KEY,
+        MANIFEST_CURRENT_KEY,
+        MANIFEST_PREVIOUS_KEY,
+    }
+    stats_new = 0
+    stats_fail = 0
+    stats_recovered = 0
+
+    for dyn in selected:
+        images: list[dict] = []
+        for idx, img_url in enumerate(dyn["imageUrls"]):
+            r2_key = f"images/{dyn['id']}/{idx}.jpg"
+
+            # If image already exists in R2, recover metadata from old index
+            if r2_key in old_objects and r2_key in old_images_map:
+                old_meta = old_images_map[r2_key]
+                meta = {
+                    "index": idx,
+                    "r2Key": r2_key,
+                    "originalWidth": old_meta.get("originalWidth", 0),
+                    "originalHeight": old_meta.get("originalHeight", 0),
+                    "storedWidth": old_meta.get("storedWidth", 0),
+                    "storedHeight": old_meta.get("storedHeight", 0),
+                    "displayWidthScale": old_meta.get("displayWidthScale", DISPLAY_WIDTH_SCALE),
+                    "compressionMode": old_meta.get("compressionMode", "horizontal-downsample-x0333-q35"),
+                }
+                images.append(meta)
+                tracked_objects.add(r2_key)
+                stats_recovered += 1
+                log(f"  [{dyn['id'][:16]}] img {idx} — recovered from old index")
+                continue
+
+            log(f"  [{dyn['id'][:16]}] img {idx+1}/{len(dyn['imageUrls'])} — processing...")
+
+            raw = download_image(img_url)
+            if not raw:
+                stats_fail += 1
+                continue
+
+            result = compress_image(raw)
+            if not result:
+                stats_fail += 1
+                continue
+
+            compressed, meta = result
+            meta["index"] = idx
+            meta["r2Key"] = r2_key
+
+            r2_put_image(r2_key, compressed)
+            images.append(meta)
+            tracked_objects.add(r2_key)
+            stats_new += 1
+
+            log(f"    Compressed: {meta['originalWidth']}x{meta['originalHeight']}"
+                f" -> {meta['storedWidth']}x{meta['storedHeight']}"
+                f"  ({len(compressed):,} bytes)")
+
+        if not images:
+            # Skip dynamics where all images failed
+            log(f"  SKIP [{dyn['id'][:16]}] — all images failed, removing from archive")
+            continue
+
+        dyn_entry = {
+            "id": dyn["id"],
+            "timestamp": dyn["timestamp"],
+            "date": dyn["date"],
+            "text": dyn["text"],
+            "fullText": dyn["fullText"],
+            "bilibiliUrl": dyn["bilibiliUrl"],
+            "tags": dyn["tags"],
+            "imageCount": len(images),
+            "images": images,
+        }
+        dynamics_data.append(dyn_entry)
+
+    log(f"  Image summary: {stats_new} new, {stats_recovered} recovered, {stats_fail} failed")
+
+    if not dynamics_data:
+        log("WARNING: No dynamics with valid images after processing. Aborting to preserve existing index.")
+        sys.exit(0)
+
+    # ---- 5. Build & upload index files ---------------------------------------
+    log("[Step 5] Building & uploading index files...")
+
+    index_data: dict = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "keepRecent": KEEP_RECENT,
+        "totalDynamics": len(dynamics_data),
+        "totalImages": sum(d["imageCount"] for d in dynamics_data),
+        "dynamics": dynamics_data,
+    }
+
+    search_index: list[dict] = []
+    for d in dynamics_data:
+        search_index.append({
+            "dynamicId": d["id"],
+            "text": d["text"],
+            "date": d["date"],
+            "tags": d["tags"],
+            "imageCount": d["imageCount"],
+        })
+
+    r2_put_json(INDEX_KEY, index_data)
+    log(f"  Uploaded {INDEX_KEY}  ({len(dynamics_data)} dynamics, {index_data['totalImages']} images)")
+
+    r2_put_json(SEARCH_INDEX_KEY, search_index)
+    log(f"  Uploaded {SEARCH_INDEX_KEY}  ({len(search_index)} entries)")
+
+    # ---- 6. Build & upload manifest ------------------------------------------
+    log("[Step 6] Building & uploading manifests...")
+
+    new_manifest: dict = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "keepRecent": KEEP_RECENT,
+        "totalImages": index_data["totalImages"],
+        "dynamics": [d["id"] for d in dynamics_data],
+        "objects": sorted(tracked_objects),
+    }
+
+    r2_put_json(MANIFEST_CURRENT_KEY, new_manifest)
+    log(f"  Uploaded {MANIFEST_CURRENT_KEY}")
+
+    if old_manifest:
+        r2_put_json(MANIFEST_PREVIOUS_KEY, old_manifest)
+        log(f"  Uploaded {MANIFEST_PREVIOUS_KEY} (backup)")
+
+    # ---- 7. Delete stale objects ---------------------------------------------
+    log("[Step 7] Cleaning up stale objects...")
+
+    protected = {MANIFEST_CURRENT_KEY, MANIFEST_PREVIOUS_KEY, INDEX_KEY, SEARCH_INDEX_KEY}
+    stale = old_objects - tracked_objects - protected
+
+    if stale:
+        log(f"  Deleting {len(stale)} stale object(s)...")
+        deleted = 0
+        for key in stale:
+            if r2_delete(key):
+                log(f"    Deleted: {key}")
+                deleted += 1
+        log(f"  Successfully deleted {deleted}/{len(stale)}.")
+    else:
+        log("  No stale objects to delete.")
+
+    # ---- 8. Final summary ----------------------------------------------------
+    log("=" * 60)
+    log("COLLECTION COMPLETE")
+    log(f"  Dynamics archived  : {len(dynamics_data)}")
+    log(f"  Total images       : {index_data['totalImages']}")
+    log(f"  Newly uploaded     : {stats_new}")
+    log(f"  Recovered (existing): {stats_recovered}")
+    log(f"  Failed             : {stats_fail}")
+    log(f"  Stale deleted      : {len(stale)}")
+    log(f"  Final R2 objects   : {len(tracked_objects)}")
+    if dynamics_data:
+        log(f"  Newest dynamic     : {dynamics_data[0]['date']}  ({dynamics_data[0]['text'][:40]}...)")
+        log(f"  Oldest dynamic     : {dynamics_data[-1]['date']}  ({dynamics_data[-1]['text'][:40]}...)")
+    log("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
