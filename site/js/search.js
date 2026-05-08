@@ -45,7 +45,7 @@
     });
 
     const ids = new Set(matched.map(function (m) { return m.dynamicId; }));
-    statusEl.textContent = matched.length + " of " + searchIndex.length + " dynamics";
+    statusEl.textContent = matched.length + " / " + searchIndex.length + " 条";
     noResults.hidden = matched.length > 0;
 
     if (onFilterCallback) onFilterCallback(ids);

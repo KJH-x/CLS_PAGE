@@ -1,9 +1,10 @@
-// app.js — Main application: fetch data, render timeline, handle interactions
+// app.js — Main application: fetch data, render gallery-first timeline
 
 (function () {
   "use strict";
 
   var R2_BASE = window.ARCHIVE_CONFIG.R2_PUBLIC_URL;
+  var PREVIEW_COUNT = 6;
 
   // DOM refs
   var timeline = document.getElementById("timeline");
@@ -17,23 +18,15 @@
   var footerCount = document.getElementById("footerCount");
 
   // State
-  var appData = null;       // Full index.json
-  var searchData = null;    // search-index.json
-  var allCards = [];        // Array of { id, element }
+  var appData = null;
+  var searchData = null;
 
   // ------------------------------------------------------------------
   // Helpers
   // ------------------------------------------------------------------
 
-  function escapeHtml(str) {
-    var d = document.createElement("div");
-    d.textContent = str;
-    return d.innerHTML;
-  }
-
   function formatDate(dateStr) {
     if (!dateStr) return "";
-    // dateStr format: "2024-05-01" or ISO timestamp
     var d = new Date(dateStr);
     if (isNaN(d.getTime())) return dateStr;
     var y = d.getFullYear();
@@ -54,14 +47,12 @@
     noResults.hidden = true;
   }
 
-  function hideLoading() {
-    loadingState.hidden = true;
-  }
+  function hideLoading() { loadingState.hidden = true; }
 
   function showError(msg) {
     hideLoading();
     errorState.hidden = false;
-    errorMsg.textContent = msg || "Failed to load archive data.";
+    errorMsg.textContent = msg || "无法加载归档数据";
     timeline.innerHTML = "";
   }
 
@@ -75,13 +66,11 @@
   // ------------------------------------------------------------------
 
   function normalizeDynamic(dyn) {
-    // Ensure consistent struct; the date field may be "2024-05-01" or ISO.
-    // images array may have missing fields → fill defaults.
     if (!dyn.images) dyn.images = [];
     dyn.images.forEach(function (img) {
-      if (!img.storedWidth) img.storedWidth = Math.round((img.originalWidth || 0) / 3);
+      if (!img.storedWidth) img.storedWidth = img.originalWidth || 0;
       if (!img.storedHeight) img.storedHeight = img.originalHeight || 0;
-      if (!img.displayWidthScale) img.displayWidthScale = 3;
+      if (!img.displayWidthScale) img.displayWidthScale = 1;
     });
     return dyn;
   }
@@ -100,7 +89,6 @@
       appData = results[0];
       searchData = results[1];
       if (!appData || !appData.dynamics) throw new Error("Invalid index format");
-
       appData.dynamics = appData.dynamics.map(normalizeDynamic);
       hideLoading();
       setupSearch();
@@ -108,7 +96,7 @@
     })
     .catch(function (err) {
       console.error("Fetch error:", err);
-      showError("Could not load archive: " + err.message);
+      showError("无法加载归档数据：" + err.message);
     });
   }
 
@@ -128,7 +116,6 @@
     emptyState.hidden = true;
     var dynamics = appData.dynamics;
 
-    // Filter by search if active
     var visibleDynamics = dynamics;
     if (searchFilterIds) {
       visibleDynamics = dynamics.filter(function (d) { return searchFilterIds.has(d.id); });
@@ -138,12 +125,10 @@
     }
 
     timeline.innerHTML = "";
-    allCards = [];
 
     visibleDynamics.forEach(function (dyn) {
       var card = createCard(dyn);
       timeline.appendChild(card);
-      allCards.push({ id: dyn.id, element: card });
     });
 
     updateFooter();
@@ -151,8 +136,14 @@
 
   function updateFooter() {
     if (appData) {
-      footerTime.textContent = appData.generatedAt ? new Date(appData.generatedAt).toLocaleString() : "";
-      footerCount.textContent = String(appData.totalDynamics || appData.dynamics.length || 0);
+      var timeStr = appData.generatedAt ? new Date(appData.generatedAt).toLocaleString("zh-CN") : "";
+      var countStr = String(appData.totalDynamics || appData.dynamics.length || 0);
+      footerTime.textContent = timeStr;
+      footerCount.textContent = countStr;
+      var hc = document.getElementById("headerCount");
+      var ht = document.getElementById("headerTime");
+      if (hc) hc.textContent = countStr;
+      if (ht) ht.textContent = timeStr;
     }
   }
 
@@ -164,7 +155,6 @@
     var card = document.createElement("article");
     card.className = "dynamic-card";
     card.dataset.id = dyn.id;
-    card.setAttribute("role", "listitem");
 
     // ---- Header ----
     var header = document.createElement("div");
@@ -174,149 +164,180 @@
     dateEl.className = "card-date";
     dateEl.textContent = formatDate(dyn.date);
 
-    var titleEl = document.createElement("span");
+    var titleEl = document.createElement("h2");
     titleEl.className = "card-title";
-    titleEl.textContent = dyn.text || "(no text)";
+    titleEl.textContent = dyn.text || "(无标题)";
     titleEl.title = dyn.fullText || dyn.text || "";
 
     header.appendChild(dateEl);
     header.appendChild(titleEl);
 
-    // Tags
+    // Meta row
+    var metaRow = document.createElement("div");
+    metaRow.className = "card-meta";
+
+    // Tags: show max 3
     if (dyn.tags && dyn.tags.length > 0) {
-      var metaEl = document.createElement("span");
-      metaEl.className = "card-meta";
-      dyn.tags.forEach(function (t) {
+      var shown = dyn.tags.slice(0, 3);
+      shown.forEach(function (t) {
         var tag = document.createElement("span");
         tag.className = "tag";
         tag.textContent = "#" + t;
-        metaEl.appendChild(tag);
+        metaRow.appendChild(tag);
       });
-      header.appendChild(metaEl);
+      if (dyn.tags.length > 3) {
+        var more = document.createElement("span");
+        more.className = "tag";
+        more.textContent = "+" + (dyn.tags.length - 3);
+        metaRow.appendChild(more);
+      }
     }
 
-    // Image count
     var countEl = document.createElement("span");
     countEl.className = "image-count-badge";
-    countEl.textContent = dyn.imageCount + " pics";
-    header.appendChild(countEl);
+    countEl.textContent = dyn.imageCount + " 张";
+    metaRow.appendChild(countEl);
 
-    // Bilibili link
     var linkEl = document.createElement("a");
     linkEl.className = "bilibili-link";
     linkEl.href = dyn.bilibiliUrl;
     linkEl.target = "_blank";
     linkEl.rel = "noopener noreferrer";
-    linkEl.textContent = "Bilibili";
-    header.appendChild(linkEl);
+    linkEl.textContent = "原动态";
+    metaRow.appendChild(linkEl);
 
-    // ---- Expand button ----
-    var expandBtn = document.createElement("button");
-    expandBtn.className = "expand-btn";
-    expandBtn.innerHTML = '<span class="arrow">&#9660;</span> ' + dyn.imageCount + " images";
+    header.appendChild(metaRow);
 
-    // ---- Image container ----
+    // ---- Preview grid (always shown, first 6 images) ----
     var imageContainer = document.createElement("div");
     imageContainer.className = "card-images";
-    imageContainer.hidden = true;
+    var imagesId = "images-" + dyn.id;
+    imageContainer.id = imagesId;
+
+    if (dyn.images && dyn.images.length > 0) {
+      var previewGrid = document.createElement("div");
+      previewGrid.className = "image-grid";
+      var previewCount = Math.min(dyn.images.length, PREVIEW_COUNT);
+      for (var i = 0; i < previewCount; i++) {
+        var tile = createTile(dyn.images[i], dyn, i);
+        previewGrid.appendChild(tile);
+      }
+      imageContainer.appendChild(previewGrid);
+
+      // Remaining images (hidden behind view-all)
+      if (dyn.images.length > PREVIEW_COUNT) {
+        var restGrid = document.createElement("div");
+        restGrid.className = "image-grid";
+        restGrid.hidden = true;
+        for (var j = PREVIEW_COUNT; j < dyn.images.length; j++) {
+          restGrid.appendChild(createTile(dyn.images[j], dyn, j));
+        }
+        imageContainer.appendChild(restGrid);
+      }
+    }
+
+    // ---- View all button ----
+    var viewAllBtn = null;
+    if (dyn.imageCount > PREVIEW_COUNT) {
+      viewAllBtn = document.createElement("button");
+      viewAllBtn.className = "view-all-btn";
+      viewAllBtn.innerHTML = '<span class="arrow">&#9660;</span> 查看全部 ' + dyn.imageCount + " 张";
+      viewAllBtn.setAttribute("aria-expanded", "false");
+      viewAllBtn.setAttribute("aria-controls", imagesId);
+    }
 
     // ---- Assemble ----
     card.appendChild(header);
-    card.appendChild(expandBtn);
     card.appendChild(imageContainer);
+    if (viewAllBtn) card.appendChild(viewAllBtn);
 
-    // ---- Expand / collapse ----
-    expandBtn.addEventListener("click", function () {
-      var isExpanded = !imageContainer.hidden;
-
-      if (isExpanded) {
-        imageContainer.hidden = true;
-        card.classList.remove("expanded");
-        expandBtn.innerHTML = '<span class="arrow">&#9660;</span> ' + dyn.imageCount + " images";
-      } else {
-        if (!imageContainer.dataset.loaded) {
-          buildImageTrack(imageContainer, dyn);
-          imageContainer.dataset.loaded = "1";
+    // ---- View all toggle ----
+    if (viewAllBtn) {
+      viewAllBtn.addEventListener("click", function () {
+        var restGrid = imageContainer.querySelectorAll(".image-grid")[1];
+        if (!restGrid) return;
+        var expanded = !restGrid.hidden;
+        if (expanded) {
+          restGrid.hidden = true;
+          card.classList.remove("expanded");
+          viewAllBtn.innerHTML = '<span class="arrow">&#9660;</span> 查看全部 ' + dyn.imageCount + " 张";
+          viewAllBtn.setAttribute("aria-expanded", "false");
+        } else {
+          restGrid.hidden = false;
+          card.classList.add("expanded");
+          viewAllBtn.innerHTML = '<span class="arrow">&#9660;</span> 收起';
+          viewAllBtn.setAttribute("aria-expanded", "true");
         }
-        imageContainer.hidden = false;
-        card.classList.add("expanded");
-        expandBtn.innerHTML = '<span class="arrow">&#9660;</span> Collapse';
-      }
-    });
+      });
+    }
 
     return card;
   }
 
   // ------------------------------------------------------------------
-  // Image track
+  // Tile creation (fixed load-order bug)
   // ------------------------------------------------------------------
 
-  function buildImageTrack(container, dyn) {
-    var images = dyn.images || [];
-    if (images.length === 0) return;
-
-    var track = document.createElement("div");
-    track.className = "image-track";
-
-    var tileHeight = getTileHeight();
-
-    images.forEach(function (meta, idx) {
-      var tile = createTile(meta, tileHeight, function () {
-        // find all images in current gallery context
-        var allImages = dyn.images || [];
-        window.openViewer(allImages, idx);
-      });
-      track.appendChild(tile);
-    });
-
-    container.appendChild(track);
-  }
+  // Tile height — 3x taller than typical thumbnail
+  var TILE_HEIGHT = 640;
 
   function getTileHeight() {
-    var style = getComputedStyle(document.documentElement);
-    var val = style.getPropertyValue("--tile-height").trim();
-    if (val && val.endsWith("px")) {
-      return parseFloat(val);
-    }
-    return 320;
+    // smaller on mobile
+    if (window.innerWidth < 480) return 400;
+    if (window.innerWidth < 768) return 500;
+    return TILE_HEIGHT;
   }
 
-  function createTile(meta, tileHeight, onClick) {
-    var origW = meta.originalWidth || (meta.storedWidth * (meta.displayWidthScale || 3));
+  function createTile(meta, dyn, idx) {
+    var tileH = getTileHeight();
+    var origW = meta.originalWidth || (meta.storedWidth * (meta.displayWidthScale || 1));
     var origH = meta.originalHeight || meta.storedHeight;
     var aspect = origH > 0 ? origW / origH : 1;
-    var tileWidth = Math.round(tileHeight * aspect);
+    var tileW = Math.round(tileH * aspect);
 
     var tile = document.createElement("div");
     tile.className = "image-tile";
-    tile.style.height = tileHeight + "px";
-    tile.style.width = tileWidth + "px";
+    tile.style.width = tileW + "px";
+    tile.style.height = tileH + "px";
 
     var img = document.createElement("img");
     img.loading = "lazy";
-    img.alt = "";
-    img.src = R2_BASE + "/" + (meta.r2Key || "");
-    img.style.width = tileWidth + "px";
-    img.style.height = tileHeight + "px";
+    img.decoding = "async";
+    img.alt = (dyn.text || "存档图片") + " #" + (meta.index + 1);
+    img.style.width = tileW + "px";
+    img.style.height = tileH + "px";
 
+    // Bind events BEFORE setting src
     img.addEventListener("load", function () {
       img.classList.add("loaded");
     });
+
     img.addEventListener("error", function () {
       img.remove();
       var ph = document.createElement("div");
       ph.className = "tile-placeholder";
-      ph.textContent = "🖼";
+      ph.textContent = "\u56FE\u7247\u52A0\u8F7D\u5931\u8D25";
       tile.appendChild(ph);
     });
 
+    img.src = R2_BASE + "/" + (meta.thumbnailKey || meta.r2Key || "");
+
+    if (img.complete) {
+      img.classList.add("loaded");
+    }
+
     tile.appendChild(img);
-    tile.addEventListener("click", onClick);
+    tile.addEventListener("click", function () {
+      console.log("[app] tile clicked, dyn.id:", dyn.id, "idx:", idx, "dyn.images count:", (dyn.images || []).length);
+      console.log("[app] meta.index (api):", meta.index, "meta.r2Key:", meta.r2Key);
+      console.log("[app] R2_BASE:", R2_BASE);
+      window.openViewer(dyn.images || [], idx);
+    });
     return tile;
   }
 
   // ------------------------------------------------------------------
-  // Search integration (called after data loads)
+  // Search
   // ------------------------------------------------------------------
 
   function setupSearch() {
@@ -330,7 +351,6 @@
         render(filterIds);
       }
     });
-    // If user already typed before data loaded, re-trigger search
     var input = document.getElementById("searchInput");
     if (input && input.value.trim()) {
       input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -340,6 +360,10 @@
   // ------------------------------------------------------------------
   // Init
   // ------------------------------------------------------------------
+
+  console.log("[app] init, ARCHIVE_CONFIG:", window.ARCHIVE_CONFIG);
+  console.log("[app] R2_BASE:", R2_BASE);
+  console.log("[app] PREVIEW_COUNT:", PREVIEW_COUNT, "TILE_HEIGHT:", TILE_HEIGHT);
 
   fetchData();
 
