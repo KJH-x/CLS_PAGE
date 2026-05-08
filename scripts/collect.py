@@ -30,18 +30,16 @@ from botocore.config import Config
 from PIL import Image, UnidentifiedImageError
 
 # ---------------------------------------------------------------------------
-# Constants
+# Runtime configuration (overridden in main for real runs)
 # ---------------------------------------------------------------------------
 
-R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
-R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
-R2_BUCKET = os.environ["R2_BUCKET"]
-R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
-R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-
-BILIBILI_COOKIE = os.environ.get("BILIBILI_COOKIE", "")
-BILIBILI_UID = os.environ["BILIBILI_UID"]
-KEEP_RECENT = int(os.environ.get("KEEP_RECENT", "10"))
+_R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY_ID", "")
+_R2_SECRET_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+_R2_BUCKET = os.environ.get("R2_BUCKET", "")
+_R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+_BILI_COOKIE = os.environ.get("BILIBILI_COOKIE", "")
+_BILI_UID = os.environ.get("BILIBILI_UID", "")
+_KEEP_RECENT = int(os.environ.get("KEEP_RECENT", "10"))
 
 DISPLAY_WIDTH_SCALE = 3
 JPEG_QUALITY = 35
@@ -52,17 +50,30 @@ MANIFEST_PREVIOUS_KEY = "manifests/previous.json"
 INDEX_KEY = "site/index.json"
 SEARCH_INDEX_KEY = "site/search-index.json"
 
-# ---------------------------------------------------------------------------
-# R2 client
-# ---------------------------------------------------------------------------
+# Private R2 client — lazy init
+_s3 = None
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-    config=Config(region_name="auto", retries={"max_attempts": 3, "mode": "standard"}),
-)
+
+def _get_s3():
+    global _s3
+    if _s3 is None:
+        endpoint = f"https://{_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+        _s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=_R2_ACCESS_KEY,
+            aws_secret_access_key=_R2_SECRET_KEY,
+            config=Config(region_name="auto", retries={"max_attempts": 3, "mode": "standard"}),
+        )
+    return _s3
+
+
+def _bili_headers() -> dict[str, str]:
+    h = dict(BILI_HEADERS_TEMPLATE)
+    h["Referer"] = f"https://space.bilibili.com/{_BILI_UID}/dynamic"
+    if _BILI_COOKIE:
+        h["Cookie"] = _BILI_COOKIE
+    return h
 
 # ---------------------------------------------------------------------------
 # R2 helpers
@@ -70,8 +81,9 @@ s3 = boto3.client(
 
 def r2_get_json(key: str) -> Optional[dict]:
     """Fetch and parse a JSON object from R2. Returns None if not found."""
+    s3 = _get_s3()
     try:
-        resp = s3.get_object(Bucket=R2_BUCKET, Key=key)
+        resp = s3.get_object(Bucket=_R2_BUCKET, Key=key)
         return json.loads(resp["Body"].read())
     except s3.exceptions.NoSuchKey:
         return None
@@ -82,9 +94,10 @@ def r2_get_json(key: str) -> Optional[dict]:
 
 def r2_put_json(key: str, data: Any, cache_max_age: int = 300) -> None:
     """Upload a JSON-serialisable object to R2."""
+    s3 = _get_s3()
     body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     s3.put_object(
-        Bucket=R2_BUCKET,
+        Bucket=_R2_BUCKET,
         Key=key,
         Body=body,
         ContentType="application/json; charset=utf-8",
@@ -94,8 +107,9 @@ def r2_put_json(key: str, data: Any, cache_max_age: int = 300) -> None:
 
 def r2_put_image(key: str, data: bytes) -> None:
     """Upload a JPEG image to R2 with long-lived cache."""
+    s3 = _get_s3()
     s3.put_object(
-        Bucket=R2_BUCKET,
+        Bucket=_R2_BUCKET,
         Key=key,
         Body=data,
         ContentType="image/jpeg",
@@ -105,8 +119,9 @@ def r2_put_image(key: str, data: bytes) -> None:
 
 def r2_delete(key: str) -> bool:
     """Delete a single object from R2. Returns True on success."""
+    s3 = _get_s3()
     try:
-        s3.delete_object(Bucket=R2_BUCKET, Key=key)
+        s3.delete_object(Bucket=_R2_BUCKET, Key=key)
         return True
     except Exception as exc:
         log(f"    WARN: Failed to delete {key}: {exc}")
@@ -137,14 +152,6 @@ BILI_HEADERS_TEMPLATE: dict[str, str] = {
 }
 
 
-def _bili_headers() -> dict[str, str]:
-    h = dict(BILI_HEADERS_TEMPLATE)
-    h["Referer"] = f"https://space.bilibili.com/{BILIBILI_UID}/dynamic"
-    if BILIBILI_COOKIE:
-        h["Cookie"] = BILIBILI_COOKIE
-    return h
-
-
 def fetch_dynamics() -> list[dict]:
     """Paginate through the user's dynamic feed and return raw items."""
     all_items: list[dict] = []
@@ -153,7 +160,7 @@ def fetch_dynamics() -> list[dict]:
 
     while page < MAX_API_PAGES:
         page += 1
-        params = f"host_mid={BILIBILI_UID}&offset={offset}&features=itemOpusStyle"
+        params = f"host_mid={_BILI_UID}&offset={offset}&features=itemOpusStyle"
         url = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?{params}"
         log(f"  Page {page}  offset={offset[:32] if offset else '(initial)'}")
 
@@ -200,6 +207,9 @@ def fetch_dynamics() -> list[dict]:
 
 _TAG_RE = re.compile(r"#(\S+?)#")
 
+# Only match dynamics with title pattern: 〓朝陇山{date}｜{name}〓上新
+_TITLE_PATTERN = re.compile(r"〓朝陇山\s*\d{1,2}\s*[A-Z][a-z]+\.?\s*[｜|].*〓上新")
+
 
 def extract_tags(text: str) -> list[str]:
     return _TAG_RE.findall(text)
@@ -211,10 +221,13 @@ def strip_tags(text: str) -> str:
 
 def extract_dynamic(item: dict) -> Optional[dict]:
     """Convert a raw Bilibili dynamic item into our internal format.
-    Returns None if the dynamic has no usable images."""
-    modules = item.get("modules", {})
-    mod_dyn = modules.get("module_dynamic", {})
-    mod_auth = modules.get("module_author", {})
+    Returns None if the dynamic has no usable images or doesn't match filters."""
+    if item.get("orig"):
+        return None
+
+    modules = item.get("modules") or {}
+    mod_dyn = modules.get("module_dynamic") or {}
+    mod_auth = modules.get("module_author") or {}
 
     dyn_id = item.get("id_str", "")
     if not dyn_id:
@@ -225,41 +238,66 @@ def extract_dynamic(item: dict) -> Optional[dict]:
     if not pub_ts:
         return None
 
-    desc = mod_dyn.get("desc", {})
-    raw_text = desc.get("text", "") or ""
-
-    major = mod_dyn.get("major", {})
+    major = mod_dyn.get("major") or {}
     major_type = major.get("type", "")
 
     image_urls: list[str] = []
+    search_text = ""
 
     if major_type == "MAJOR_TYPE_DRAW":
-        for it in major.get("draw", {}).get("items", []):
+        draw = major.get("draw") or {}
+        for it in draw.get("items", []):
             src = it.get("src", "")
             if src:
-                image_urls.append(src)
+                image_urls.append({"url": src, "width": it.get("width", 0), "height": it.get("height", 0)})
 
     elif major_type == "MAJOR_TYPE_OPUS":
-        for pic in major.get("opus", {}).get("pics", []):
+        opus = major.get("opus") or {}
+        for pic in opus.get("pics", []):
             url = pic.get("url", "")
             if url:
-                image_urls.append(url)
+                image_urls.append({"url": url, "width": pic.get("width", 0), "height": pic.get("height", 0)})
+        # Text lives in summary.text; fallback to title
+        summary = opus.get("summary") or {}
+        search_text = summary.get("text", "") or opus.get("title", "") or ""
 
     if not image_urls:
         return None
 
-    tags = extract_tags(raw_text)
-    first_line = raw_text.split("\n")[0].strip()
-    title = strip_tags(first_line)
-    if not title and raw_text:
-        title = strip_tags(raw_text[:80]).strip()
+    # Filter: only keep dynamics matching "〓朝陇山...〓..."
+    if not _TITLE_PATTERN.search(search_text):
+        return None
+
+    # Title: find the line containing the 〓朝陇山...〓上新 pattern
+    title = ""
+    for line in search_text.split("\n"):
+        line = line.strip()
+        if _TITLE_PATTERN.search(line):
+            title = strip_tags(line).strip()
+            break
+    if not title:
+        # Fallback: first line with 〓
+        for line in search_text.split("\n"):
+            line = line.strip()
+            if "〓" in line:
+                title = strip_tags(line).strip()
+                break
+    if not title:
+        first_line = search_text.split("\n")[0].strip()
+        title = strip_tags(first_line)
+    # Strip "互动抽奖" prefix
+    title = re.sub(r"^互动抽奖\s*", "", title).strip()
+    if not title:
+        title = "(no title)"
+
+    tags = extract_tags(search_text)
 
     return {
         "id": dyn_id,
         "timestamp": pub_ts,
         "date": pub_time,
         "text": title,
-        "fullText": raw_text,
+        "fullText": search_text,
         "bilibiliUrl": f"https://t.bilibili.com/{dyn_id}",
         "tags": tags,
         "imageUrls": image_urls,
@@ -347,9 +385,9 @@ def compress_image(raw: bytes) -> Optional[tuple[bytes, dict]]:
 def main() -> None:
     log("=" * 60)
     log("Bilibili Dynamic Archiver — Cloudflare R2 edition")
-    log(f"  UID        : {BILIBILI_UID}")
-    log(f"  KEEP_RECENT: {KEEP_RECENT}")
-    log(f"  R2 bucket  : {R2_BUCKET}")
+    log(f"  UID        : {_BILI_UID}")
+    log(f"  KEEP_RECENT: {_KEEP_RECENT}")
+    log(f"  R2 bucket  : {_R2_BUCKET}")
     log("=" * 60)
 
     # ---- 1. Load previous state ---------------------------------------------
@@ -387,10 +425,22 @@ def main() -> None:
         if info:
             candidates.append(info)
 
-    candidates.sort(key=lambda d: d["timestamp"], reverse=True)
-    selected = candidates[:KEEP_RECENT]
+    candidates.sort(key=lambda d: d["timestamp"])  # oldest first for dedup
+    # Deduplicate: keep the earliest dynamic per activity name
+    _ACTIVITY_RE = re.compile(r"[｜|](.+?)〓")
+    seen_activities: set[str] = set()
+    deduped: list[dict] = []
+    for c in candidates:
+        m = _ACTIVITY_RE.search(c["text"])
+        group = m.group(1).strip() if m else c["text"]
+        if group not in seen_activities:
+            seen_activities.add(group)
+            deduped.append(c)
+    log(f"  After dedup (by activity, kept earliest): {len(deduped)} unique activities")
+    deduped.sort(key=lambda d: d["timestamp"], reverse=True)
+    selected = deduped[:_KEEP_RECENT]
     log(f"  Candidates with images: {len(candidates)}")
-    log(f"  Selected (top {KEEP_RECENT}): {len(selected)}")
+    log(f"  Selected (top {_KEEP_RECENT}): {len(selected)}")
 
     if not selected:
         log("WARNING: No image-containing dynamics found. Aborting to preserve existing index.")
@@ -411,8 +461,16 @@ def main() -> None:
 
     for dyn in selected:
         images: list[dict] = []
-        for idx, img_url in enumerate(dyn["imageUrls"]):
+        for idx, img_info in enumerate(dyn["imageUrls"]):
+            img_url = img_info["url"]
+            api_w = img_info.get("width", 0)
+            api_h = img_info.get("height", 0)
             r2_key = f"images/{dyn['id']}/{idx}.jpg"
+
+            # Skip square images (e.g. 500x500 icons)
+            if api_w > 0 and api_h > 0 and api_w == api_h:
+                log(f"  [{dyn['id'][:16]}] img {idx} — square ({api_w}x{api_h}), skipped")
+                continue
 
             # If image already exists in R2, recover metadata from old index
             if r2_key in old_objects and r2_key in old_images_map:
@@ -487,7 +545,7 @@ def main() -> None:
 
     index_data: dict = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "keepRecent": KEEP_RECENT,
+        "keepRecent": _KEEP_RECENT,
         "totalDynamics": len(dynamics_data),
         "totalImages": sum(d["imageCount"] for d in dynamics_data),
         "dynamics": dynamics_data,
@@ -514,7 +572,7 @@ def main() -> None:
 
     new_manifest: dict = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "keepRecent": KEEP_RECENT,
+        "keepRecent": _KEEP_RECENT,
         "totalImages": index_data["totalImages"],
         "dynamics": [d["id"] for d in dynamics_data],
         "objects": sorted(tracked_objects),
