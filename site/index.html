@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<title>Bilibili Dynamic Archive</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <h1 class="site-title">Bilibili Archive</h1>
+    <div class="header-controls">
+      <button class="theme-toggle" id="themeToggle" title="Toggle theme" aria-label="Toggle light/dark theme">
+        <span class="icon-sun">☀</span>
+        <span class="icon-moon">☾</span>
+      </button>
+    </div>
+  </div>
+</header>
+
+<div class="search-bar" id="searchBar">
+  <input
+    type="search"
+    id="searchInput"
+    class="search-input"
+    placeholder="Search by text, tag, or date..."
+    autocomplete="off"
+    aria-label="Search dynamics"
+  />
+  <button class="search-clear" id="searchClear" hidden aria-label="Clear search">✕</button>
+  <span class="search-status" id="searchStatus"></span>
+</div>
+
+<main class="main-content">
+  <div class="loading-state" id="loadingState" hidden>
+    <div class="skeleton-card" aria-hidden="true">
+      <div class="skel-line w-30"></div>
+      <div class="skel-line w-60"></div>
+      <div class="skel-line w-40"></div>
+    </div>
+    <div class="skeleton-card" aria-hidden="true">
+      <div class="skel-line w-25"></div>
+      <div class="skel-line w-55"></div>
+      <div class="skel-line w-35"></div>
+    </div>
+    <div class="skeleton-card" aria-hidden="true">
+      <div class="skel-line w-30"></div>
+      <div class="skel-line w-50"></div>
+    </div>
+  </div>
+
+  <div class="error-state" id="errorState" hidden>
+    <div class="error-icon">!</div>
+    <p class="error-message" id="errorMessage"></p>
+    <button class="error-retry" id="errorRetry">Retry</button>
+  </div>
+
+  <div class="empty-state" id="emptyState" hidden>
+    <p>No archived dynamics yet.</p>
+    <p class="empty-sub">Check back after the first collection run.</p>
+  </div>
+
+  <div class="timeline" id="timeline" role="list"></div>
+
+  <div class="no-results" id="noResults" hidden>
+    <p>No dynamics match your search.</p>
+    <button class="error-retry" id="clearSearchBtn">Clear search</button>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <p>Archive generated <time id="footerTime"></time> &middot; Recent <span id="footerCount"></span> dynamics</p>
+  <p class="footer-credit">Images from Bilibili &middot; <a href="https://space.bilibili.com/" target="_blank" rel="noopener">Source</a></p>
+</footer>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-close" id="lbClose" aria-label="Close viewer">✕</button>
+  <button class="lb-nav lb-prev" id="lbPrev" aria-label="Previous image">‹</button>
+  <button class="lb-nav lb-next" id="lbNext" aria-label="Next image">›</button>
+  <div class="lb-counter" id="lbCounter"></div>
+  <div class="lb-content" id="lbContent"></div>
+</div>
+
+<script src="js/config.js"></script>
+<script src="js/theme.js"></script>
+<script src="js/search.js"></script>
+<script src="js/viewer.js"></script>
+<script src="js/app.js"></script>
+
+</body>
+</html>
