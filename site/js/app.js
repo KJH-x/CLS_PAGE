@@ -35,6 +35,68 @@
     return y + "-" + m + "-" + day;
   }
 
+  function getActivitySlug(text) {
+    var m = text.match(/[｜|](.+?)〓/);
+    return m ? m[1].trim() : "";
+  }
+
+  // ------------------------------------------------------------------
+  // Routing — open a specific dynamic via URL
+  // ------------------------------------------------------------------
+
+  function checkRoute() {
+    if (!appData || !appData.dynamics) return false;
+
+    var targetId = null;
+    var targetActivity = null;
+
+    // Check path: /to/{activity-slug}/
+    var pathMatch = window.location.pathname.match(/\/to\/(.+?)\/?$/);
+    if (pathMatch) {
+      targetActivity = decodeURIComponent(pathMatch[1]);
+    }
+
+    // Check hash: #id-{dynamicId}
+    var hashMatch = window.location.hash.match(/^#id-(.+)$/);
+    if (hashMatch) {
+      targetId = hashMatch[1];
+    }
+
+    if (!targetId && !targetActivity) return false;
+
+    var found = null;
+    for (var i = 0; i < appData.dynamics.length; i++) {
+      var d = appData.dynamics[i];
+      if (targetId && d.id === targetId) { found = d; break; }
+      if (targetActivity && getActivitySlug(d.text) === targetActivity) { found = d; break; }
+    }
+    if (!found) return false;
+
+    navigateToDynamic(found);
+    return true;
+  }
+
+  function navigateToDynamic(dyn) {
+    // Wait a tick for DOM to render
+    requestAnimationFrame(function () {
+      var card = document.querySelector('.dynamic-card[data-id="' + dyn.id + '"]');
+      if (card) {
+        // Make images eager for this card
+        var imgs = card.querySelectorAll('img[loading="lazy"]');
+        imgs.forEach(function (img) { img.loading = "eager"; });
+
+        card.scrollIntoView({ behavior: "smooth", block: "start" });
+
+        // Open lightbox with first image after scroll settles
+        setTimeout(function () {
+          if (dyn.images && dyn.images.length > 0) {
+            window.openViewer(dyn.images, 0);
+          }
+        }, 600);
+      }
+    });
+  }
+
   // ------------------------------------------------------------------
   // States
   // ------------------------------------------------------------------
@@ -93,6 +155,9 @@
       hideLoading();
       setupSearch();
       render();
+      if (!checkRoute()) {
+        // no route matched — normal view
+      }
     })
     .catch(function (err) {
       console.error("Fetch error:", err);
