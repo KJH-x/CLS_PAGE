@@ -6,7 +6,6 @@ Cloudflare Pages + GitHub Actions + Cloudflare R2. No Workers.
 ## URLs
 
 - Site: https://cls.nslc.top/
-- R2: https://cls.r2.nsapi.top/
 
 ## Features
 
