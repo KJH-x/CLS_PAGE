@@ -77,7 +77,12 @@
   }
 
   function navigateToDynamic(dyn) {
-    // Wait a tick for DOM to render
+    // Rewrite URL bar to clean base URL
+    var cleanUrl = window.location.origin + "/";
+    if (window.location.pathname !== "/" || window.location.hash) {
+      history.replaceState(null, "", cleanUrl);
+    }
+
     requestAnimationFrame(function () {
       var card = document.querySelector('.dynamic-card[data-id="' + dyn.id + '"]');
       if (card) {
