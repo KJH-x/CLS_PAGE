@@ -41,14 +41,17 @@ _BILI_COOKIE = os.environ.get("BILIBILI_COOKIE", "")
 _BILI_UID = os.environ.get("BILIBILI_UID", "")
 _KEEP_RECENT = int(os.environ.get("KEEP_RECENT", "10"))
 
-DISPLAY_WIDTH_SCALE = 3
+DISPLAY_WIDTH_SCALE = 1  # no horizontal downsampling
 JPEG_QUALITY = 35
+THUMB_QUALITY = 40
+THUMB_SCALE = 2  # thumbnail = 1/2 original width & height
 MAX_API_PAGES = 20
 
 MANIFEST_CURRENT_KEY = "manifests/current.json"
 MANIFEST_PREVIOUS_KEY = "manifests/previous.json"
 INDEX_KEY = "site/index.json"
 SEARCH_INDEX_KEY = "site/search-index.json"
+LAST_ID_KEY = "config/last-dynamic-id.json"
 
 # Private R2 client — lazy init
 _s3 = None
@@ -128,6 +131,34 @@ def r2_delete(key: str) -> bool:
         return False
 
 
+def r2_list_all() -> dict[str, int]:
+    """List R2 state — returns {prefix: object_count}."""
+    s3 = _get_s3()
+    prefixes: dict[str, int] = {}
+    total = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=_R2_BUCKET):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            total += 1
+            # Group by top-level prefix
+            prefix = key.split("/")[0] if "/" in key else "(root)"
+            prefixes[prefix] = prefixes.get(prefix, 0) + 1
+    prefixes["(total)"] = total
+    return prefixes
+
+
+def r2_get_last_id() -> Optional[str]:
+    """Read the last processed dynamic ID from R2."""
+    data = r2_get_json(LAST_ID_KEY)
+    return data.get("lastDynamicId") if data else None
+
+
+def r2_put_last_id(dyn_id: str) -> None:
+    """Store the last processed dynamic ID on R2."""
+    r2_put_json(LAST_ID_KEY, {"lastDynamicId": dyn_id})
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -152,9 +183,12 @@ BILI_HEADERS_TEMPLATE: dict[str, str] = {
 }
 
 
-def fetch_dynamics() -> list[dict]:
-    """Paginate through the user's dynamic feed and return raw items."""
+def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[str]]:
+    """Paginate through the user's dynamic feed. If last_id is provided, stop
+    when that ID is encountered (incremental mode).
+    Returns (items, newest_id) where newest_id is the first item's ID."""
     all_items: list[dict] = []
+    newest_id: Optional[str] = None
     offset = ""
     page = 0
 
@@ -185,7 +219,20 @@ def fetch_dynamics() -> list[dict]:
             log("  No more items.")
             break
 
-        all_items.extend(items)
+        # Check for last_id → stop when we hit already-processed content
+        stop_early = False
+        for item in items:
+            item_id = item.get("id_str", "")
+            if last_id and item_id == last_id:
+                log(f"  Hit last_id={last_id[:16]} — stopping incremental fetch.")
+                stop_early = True
+                break
+            all_items.append(item)
+            if newest_id is None:
+                newest_id = item_id
+
+        if stop_early:
+            break
 
         has_more = page_data.get("has_more", False)
         if not has_more:
@@ -198,7 +245,7 @@ def fetch_dynamics() -> list[dict]:
             break
         offset = next_offset
 
-    return all_items
+    return all_items, newest_id
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +378,7 @@ def download_image(url: str) -> Optional[bytes]:
 
 
 def compress_image(raw: bytes) -> Optional[tuple[bytes, dict]]:
-    """Compress a JPEG image: convert to RGB, resize width to 1/3, save progressive q35.
+    """Compress a JPEG image: convert to RGB, save progressive q35 at original dimensions.
     Returns (compressed_bytes, metadata_dict) or None on failure."""
     try:
         img = Image.open(io.BytesIO(raw))
@@ -340,13 +387,7 @@ def compress_image(raw: bytes) -> Optional[tuple[bytes, dict]]:
         if img.mode != "RGB":
             img = img.convert("RGB")
 
-        stored_w = round(original_w / DISPLAY_WIDTH_SCALE)
-        if stored_w < 1:
-            stored_w = 1
-        stored_h = original_h
-
-        if stored_w < original_w:
-            img = img.resize((stored_w, stored_h), Image.Resampling.LANCZOS)
+        # No resize — store at original dimensions
 
         buf = io.BytesIO()
         img.save(
@@ -362,10 +403,10 @@ def compress_image(raw: bytes) -> Optional[tuple[bytes, dict]]:
         meta = {
             "originalWidth": original_w,
             "originalHeight": original_h,
-            "storedWidth": stored_w,
-            "storedHeight": stored_h,
-            "displayWidthScale": DISPLAY_WIDTH_SCALE,
-            "compressionMode": "horizontal-downsample-x0333-q35",
+            "storedWidth": original_w,
+            "storedHeight": original_h,
+            "displayWidthScale": 1,
+            "compressionMode": "original-q35",
         }
         return compressed, meta
 
@@ -375,6 +416,26 @@ def compress_image(raw: bytes) -> Optional[tuple[bytes, dict]]:
     except Exception as exc:
         log(f"      Compression error: {exc}")
         traceback.print_exc()
+        return None
+
+
+def make_thumbnail(raw: bytes) -> Optional[bytes]:
+    """Generate thumbnail at 1/2 original dimensions."""
+    try:
+        img = Image.open(io.BytesIO(raw))
+        orig_w, orig_h = img.size
+        thumb_w = max(1, orig_w // THUMB_SCALE)
+        thumb_h = max(1, orig_h // THUMB_SCALE)
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        img = img.resize((thumb_w, thumb_h), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True, progressive=True, subsampling="4:2:0")
+        return buf.getvalue()
+    except Exception:
         return None
 
 
@@ -390,6 +451,17 @@ def main() -> None:
     log(f"  R2 bucket  : {_R2_BUCKET}")
     log("=" * 60)
 
+    # ---- 0. Check R2 state ---------------------------------------------------
+    log("[Step 0] Checking R2 state...")
+    r2_state = r2_list_all()
+    for prefix, count in sorted(r2_state.items()):
+        log(f"  {prefix}: {count} objects")
+    last_id = r2_get_last_id()
+    if last_id:
+        log(f"  Last processed dynamic ID: {last_id[:16]}... (incremental mode)")
+    else:
+        log("  No last-dynamic-id found (full fetch)")
+
     # ---- 1. Load previous state ---------------------------------------------
     log("[Step 1] Loading previous state...")
     old_manifest = r2_get_json(MANIFEST_CURRENT_KEY)
@@ -399,10 +471,9 @@ def main() -> None:
         old_objects = set(old_manifest.get("objects", []))
         log(f"  Found previous manifest with {len(old_objects)} objects.")
 
-    # Load previous index.json to recover metadata for already-uploaded images
     old_index = r2_get_json(INDEX_KEY)
     old_dynamics_map: dict[str, dict] = {}
-    old_images_map: dict[str, dict] = {}  # r2_key → image metadata
+    old_images_map: dict[str, dict] = {}
     if old_index:
         for od in old_index.get("dynamics", []):
             old_dynamics_map[od.get("id", "")] = od
@@ -414,8 +485,10 @@ def main() -> None:
 
     # ---- 2. Fetch dynamics ---------------------------------------------------
     log("[Step 2] Fetching Bilibili dynamics...")
-    raw_items = fetch_dynamics()
+    raw_items, newest_id = fetch_dynamics(last_id)
     log(f"  Fetched {len(raw_items)} raw items total.")
+    if newest_id:
+        log(f"  Newest dynamic ID: {newest_id[:16]}...")
 
     # ---- 3. Extract candidates -----------------------------------------------
     log("[Step 3] Extracting dynamics with images...")
@@ -454,6 +527,7 @@ def main() -> None:
         SEARCH_INDEX_KEY,
         MANIFEST_CURRENT_KEY,
         MANIFEST_PREVIOUS_KEY,
+        LAST_ID_KEY,
     }
     stats_new = 0
     stats_fail = 0
@@ -478,15 +552,18 @@ def main() -> None:
                 meta = {
                     "index": idx,
                     "r2Key": r2_key,
+                    "thumbnailKey": old_meta.get("thumbnailKey", ""),
                     "originalWidth": old_meta.get("originalWidth", 0),
                     "originalHeight": old_meta.get("originalHeight", 0),
                     "storedWidth": old_meta.get("storedWidth", 0),
                     "storedHeight": old_meta.get("storedHeight", 0),
                     "displayWidthScale": old_meta.get("displayWidthScale", DISPLAY_WIDTH_SCALE),
-                    "compressionMode": old_meta.get("compressionMode", "horizontal-downsample-x0333-q35"),
+                    "compressionMode": old_meta.get("compressionMode", "original-q35"),
                 }
                 images.append(meta)
                 tracked_objects.add(r2_key)
+                if meta["thumbnailKey"]:
+                    tracked_objects.add(meta["thumbnailKey"])
                 stats_recovered += 1
                 log(f"  [{dyn['id'][:16]}] img {idx} — recovered from old index")
                 continue
@@ -507,6 +584,17 @@ def main() -> None:
             meta["index"] = idx
             meta["r2Key"] = r2_key
 
+            # Generate and upload thumbnail
+            thumb_key = f"thumbs/{dyn['id']}/{idx}.jpg"
+            thumb_data = make_thumbnail(raw)
+            if thumb_data:
+                r2_put_image(thumb_key, thumb_data)
+                meta["thumbnailKey"] = thumb_key
+                tracked_objects.add(thumb_key)
+                log(f"    Thumbnail: {thumb_key}")
+            else:
+                meta["thumbnailKey"] = ""
+
             r2_put_image(r2_key, compressed)
             images.append(meta)
             tracked_objects.add(r2_key)
@@ -520,6 +608,10 @@ def main() -> None:
             # Skip dynamics where all images failed
             log(f"  SKIP [{dyn['id'][:16]}] — all images failed, removing from archive")
             continue
+
+        # Re-number indices sequentially after square filtering
+        for new_idx, img in enumerate(images):
+            img["index"] = new_idx
 
         dyn_entry = {
             "id": dyn["id"],
@@ -585,24 +677,17 @@ def main() -> None:
         r2_put_json(MANIFEST_PREVIOUS_KEY, old_manifest)
         log(f"  Uploaded {MANIFEST_PREVIOUS_KEY} (backup)")
 
-    # ---- 7. Delete stale objects ---------------------------------------------
-    log("[Step 7] Cleaning up stale objects...")
-
-    protected = {MANIFEST_CURRENT_KEY, MANIFEST_PREVIOUS_KEY, INDEX_KEY, SEARCH_INDEX_KEY}
-    stale = old_objects - tracked_objects - protected
-
-    if stale:
-        log(f"  Deleting {len(stale)} stale object(s)...")
-        deleted = 0
-        for key in stale:
-            if r2_delete(key):
-                log(f"    Deleted: {key}")
-                deleted += 1
-        log(f"  Successfully deleted {deleted}/{len(stale)}.")
+    # ---- 7. Save last-dynamic-id for incremental runs ------------------------
+    if newest_id and dynamics_data:
+        r2_put_last_id(newest_id)
+        log(f"  Saved last-dynamic-id: {newest_id[:16]}...")
     else:
-        log("  No stale objects to delete.")
+        log("  Skipped last-dynamic-id save (no new items or no newest_id)")
 
-    # ---- 8. Final summary ----------------------------------------------------
+    # ---- 8. Skip stale cleanup (keep all objects for now) --------------------
+    log("[Step 8] Cleanup skipped — retaining all objects.")
+
+    # ---- 9. Final summary ----------------------------------------------------
     log("=" * 60)
     log("COLLECTION COMPLETE")
     log(f"  Dynamics archived  : {len(dynamics_data)}")
@@ -610,7 +695,6 @@ def main() -> None:
     log(f"  Newly uploaded     : {stats_new}")
     log(f"  Recovered (existing): {stats_recovered}")
     log(f"  Failed             : {stats_fail}")
-    log(f"  Stale deleted      : {len(stale)}")
     log(f"  Final R2 objects   : {len(tracked_objects)}")
     if dynamics_data:
         log(f"  Newest dynamic     : {dynamics_data[0]['date']}  ({dynamics_data[0]['text'][:40]}...)")
