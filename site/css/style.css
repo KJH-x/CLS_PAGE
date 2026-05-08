@@ -434,6 +434,26 @@ input { font-family: inherit; }
   transform-origin: 0 0;
 }
 
+.lb-content.mobile-reading {
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+
+.lb-content.mobile-reading .lb-stage {
+  display: block;
+  width: 100%;
+  min-height: auto;
+}
+
+.lb-content.mobile-reading img {
+  width: 100%;
+  max-width: none;
+  max-height: none;
+}
+
 .lb-stage img {
   display: block;
   max-width: none;
@@ -443,6 +463,7 @@ input { font-family: inherit; }
 /* when zoomed, lock scroll and use transform pan */
 .lb-content.zoomed {
   overflow: hidden;
+  touch-action: none;
 }
 .lb-content.zoomed .lb-stage {
   display: block;

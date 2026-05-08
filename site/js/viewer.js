@@ -35,6 +35,7 @@
   var pinchBaseDist = 0;
   var pinchBaseZoom = 1;
   var swipeStartX = 0;
+  var swipeStartY = 0;
 
   // Tip timer
   var tipTimer = null;
@@ -45,6 +46,14 @@
     return (window.ARCHIVE_CONFIG && window.ARCHIVE_CONFIG.R2_PUBLIC_URL)
       ? window.ARCHIVE_CONFIG.R2_PUBLIC_URL.replace(/\/+$/, "")
       : "";
+  }
+
+  function isMobileReadingMode() {
+    return window.innerWidth <= 768;
+  }
+
+  function currentMinZoom() {
+    return isMobileReadingMode() ? 1 : MIN_ZOOM;
   }
 
   // --- Clamp ---
@@ -99,7 +108,7 @@
   function zoomAt(cx, cy, delta) {
     var oldZoom = zoom;
     var newZoom = Math.round((zoom + delta) * 100) / 100;
-    newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+    newZoom = Math.max(currentMinZoom(), Math.min(MAX_ZOOM, newZoom));
     if (newZoom === oldZoom) return;
 
     // If transitioning zoom=1 -> >1, capture native scroll to avoid jump
@@ -124,10 +133,20 @@
   }
 
   function resetZoomToFit() {
+    var restoreScrollTop = 0;
+    if (isMobileReadingMode() && zoom > 1.001) {
+      restoreScrollTop = Math.max(0, Math.min(
+        Math.max(0, baseH - content.clientHeight),
+        Math.round(-ty / zoom)
+      ));
+    }
     zoom = 1;
     tx = 0; ty = 0;
     setZoomed(false);
     applyTransform();
+    if (isMobileReadingMode()) {
+      content.scrollTop = restoreScrollTop;
+    }
     showZoomBadge();
   }
 
@@ -148,12 +167,19 @@
     var vh = window.innerHeight;
     var dispW, dispH;
 
-    if (vw * 0.96 / aspect <= vh * 0.88) {
-      dispW = Math.round(vw * 0.96);
+    content.classList.toggle("mobile-reading", isMobileReadingMode());
+
+    if (isMobileReadingMode()) {
+      dispW = Math.round(vw);
       dispH = Math.round(dispW / aspect);
     } else {
-      dispH = Math.round(vh * 0.88);
-      dispW = Math.round(dispH * aspect);
+      if (vw * 0.96 / aspect <= vh * 0.88) {
+        dispW = Math.round(vw * 0.96);
+        dispH = Math.round(dispW / aspect);
+      } else {
+        dispH = Math.round(vh * 0.88);
+        dispW = Math.round(dispH * aspect);
+      }
     }
 
     baseW = dispW;
@@ -262,6 +288,7 @@
     zoom = 1; tx = 0; ty = 0;
     stage.innerHTML = "";
     thumbStrip.innerHTML = "";
+    content.classList.remove("mobile-reading");
     setZoomed(false);
   }
 
@@ -276,6 +303,9 @@
   // --- Tip ---
 
   function showTip() {
+    tipEl.textContent = isMobileReadingMode()
+      ? "上下滑动阅读 · 双指缩放 · 放大后拖动"
+      : "滚轮缩放 · 拖拽移动 · Shift+滚轮上下 · 方向键切换";
     tipEl.hidden = false;
     tipEl.classList.add("visible");
     clearTimeout(tipTimer);
@@ -357,6 +387,11 @@
   // --- Touch ---
   content.addEventListener("touchstart", function (e) {
     if (e.touches.length === 2) {
+      e.preventDefault();
+      if (zoom <= 1.001) {
+        tx = 0;
+        ty = -content.scrollTop;
+      }
       var ddx = e.touches[0].clientX - e.touches[1].clientX;
       var ddy = e.touches[0].clientY - e.touches[1].clientY;
       pinchBaseDist = Math.sqrt(ddx * ddx + ddy * ddy);
@@ -367,27 +402,37 @@
       dragSY = e.touches[0].clientY;
       dragTX = tx;
       dragTY = ty;
-      dragging = true;
+      dragging = zoom > 1.001 || !isMobileReadingMode();
       dragMoved = false;
     }
     swipeStartX = e.touches[0].clientX;
-  }, { passive: true });
+    swipeStartY = e.touches[0].clientY;
+  }, { passive: false });
 
   content.addEventListener("touchmove", function (e) {
     if (e.touches.length === 2 && pinchBaseDist > 0) {
+      e.preventDefault();
       var ddx = e.touches[0].clientX - e.touches[1].clientX;
       var ddy = e.touches[0].clientY - e.touches[1].clientY;
+      var rect = content.getBoundingClientRect();
+      var cx = ((e.touches[0].clientX + e.touches[1].clientX) / 2) - rect.left;
+      var cy = ((e.touches[0].clientY + e.touches[1].clientY) / 2) - rect.top;
       var dist = Math.sqrt(ddx * ddx + ddy * ddy);
       var newZoom = pinchBaseZoom * (dist / pinchBaseDist);
-      newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
-      var ratio = newZoom / zoom;
+      newZoom = Math.max(currentMinZoom(), Math.min(MAX_ZOOM, newZoom));
+      if (newZoom === zoom) return;
+      var oldZoom = zoom;
+      var ix = (cx - tx) / oldZoom;
+      var iy = (cy - ty) / oldZoom;
       zoom = newZoom;
-      tx *= ratio; ty *= ratio;
+      tx = cx - ix * zoom;
+      ty = cy - iy * zoom;
       clampPan();
       setZoomed(zoom > 1.001);
       applyTransform();
       showZoomBadge();
     } else if (e.touches.length === 1 && dragging) {
+      e.preventDefault();
       var dx = e.touches[0].clientX - dragSX;
       var dy = e.touches[0].clientY - dragSY;
       if (!dragMoved && Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return;
@@ -402,9 +447,10 @@
   content.addEventListener("touchend", function (e) {
     if (e.touches.length === 0) {
       // Swipe for prev/next (only at zoom=1 and no drag)
-      if (!dragMoved && zoom <= 1.001) {
+      if (!dragMoved && zoom <= 1.001 && !isMobileReadingMode()) {
         var swipeDx = swipeStartX - e.changedTouches[0].clientX;
-        if (Math.abs(swipeDx) > 60) {
+        var swipeDy = swipeStartY - e.changedTouches[0].clientY;
+        if (Math.abs(swipeDx) > 60 && Math.abs(swipeDx) > Math.abs(swipeDy)) {
           if (swipeDx > 0) next(); else prev();
         }
       }
