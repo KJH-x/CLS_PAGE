@@ -19,7 +19,24 @@
 
   // State
   var appData = null;
-  var searchData = null;
+  var currentCategory = "";
+  var routeTarget = null;
+
+  function setCategory(cat) {
+    currentCategory = cat;
+    document.querySelectorAll(".filter-btn").forEach(function (btn) {
+      btn.classList.toggle("active", btn.dataset.cat === cat);
+    });
+    render();
+  }
+
+  function initFilterBar() {
+    document.querySelectorAll(".filter-btn").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        setCategory(this.dataset.cat);
+      });
+    });
+  }
 
   // ------------------------------------------------------------------
   // Helpers
@@ -43,37 +60,39 @@
   // ------------------------------------------------------------------
   // Routing — open a specific dynamic via URL
   // ------------------------------------------------------------------
+  var routeTarget = null; // dynamic to open after render
 
   function checkRoute() {
-    if (!appData || !appData.dynamics) return false;
+    if (!appData || !appData.dynamics) return;
 
     var targetId = null;
     var targetActivity = null;
 
-    // Check path: /to/{activity-slug}/
     var pathMatch = window.location.pathname.match(/\/to\/(.+?)\/?$/);
     if (pathMatch) {
       targetActivity = decodeURIComponent(pathMatch[1]);
     }
 
-    // Check hash: #id-{dynamicId}
     var hashMatch = window.location.hash.match(/^#id-(.+)$/);
     if (hashMatch) {
       targetId = hashMatch[1];
     }
 
-    if (!targetId && !targetActivity) return false;
+    if (!targetId && !targetActivity) return;
 
-    var found = null;
     for (var i = 0; i < appData.dynamics.length; i++) {
       var d = appData.dynamics[i];
-      if (targetId && d.id === targetId) { found = d; break; }
-      if (targetActivity && getActivitySlug(d.text) === targetActivity) { found = d; break; }
+      if (targetId && d.id === targetId) { routeTarget = d; break; }
+      if (targetActivity && getActivitySlug(d.text) === targetActivity) { routeTarget = d; break; }
     }
-    if (!found) return false;
 
-    navigateToDynamic(found);
-    return true;
+    if (routeTarget) {
+      // Show all categories so the target isn't hidden
+      currentCategory = "";
+      document.querySelectorAll(".filter-btn").forEach(function (btn) {
+        btn.classList.toggle("active", btn.dataset.cat === "");
+      });
+    }
   }
 
   function navigateToDynamic(dyn) {
@@ -86,13 +105,9 @@
     requestAnimationFrame(function () {
       var card = document.querySelector('.dynamic-card[data-id="' + dyn.id + '"]');
       if (card) {
-        // Make images eager for this card
         var imgs = card.querySelectorAll('img[loading="lazy"]');
         imgs.forEach(function (img) { img.loading = "eager"; });
-
         card.scrollIntoView({ behavior: "smooth", block: "start" });
-
-        // Open lightbox with first image after scroll settles
         setTimeout(function () {
           if (dyn.images && dyn.images.length > 0) {
             window.openViewer(dyn.images, 0);
@@ -159,9 +174,10 @@
       appData.dynamics = appData.dynamics.map(normalizeDynamic);
       hideLoading();
       setupSearch();
-      render();
-      if (!checkRoute()) {
-        // no route matched — normal view
+      checkRoute();          // detect route, may override currentCategory
+      render();              // render with current filter
+      if (routeTarget) {
+        navigateToDynamic(routeTarget);
       }
     })
     .catch(function (err) {
@@ -192,6 +208,12 @@
       noResults.hidden = visibleDynamics.length > 0;
     } else {
       noResults.hidden = true;
+    }
+
+    if (currentCategory) {
+      visibleDynamics = visibleDynamics.filter(function (d) {
+        return (d.category || "") === currentCategory;
+      });
     }
 
     timeline.innerHTML = "";
@@ -434,6 +456,9 @@
   console.log("[app] init, ARCHIVE_CONFIG:", window.ARCHIVE_CONFIG);
   console.log("[app] R2_BASE:", R2_BASE);
   console.log("[app] PREVIEW_COUNT:", PREVIEW_COUNT, "TILE_HEIGHT:", TILE_HEIGHT);
+
+  initFilterBar();
+  setCategory("上新");
 
   fetchData();
 

@@ -203,6 +203,30 @@ input { font-family: inherit; }
 }
 
 /* ------------------------------------------------------------------
+   Filter Bar
+   ------------------------------------------------------------------ */
+.filter-bar {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 4px 20px 0;
+  display: flex; gap: 6px;
+}
+
+.filter-btn {
+  padding: 5px 14px;
+  font-size: 0.82rem;
+  border-radius: 16px;
+  background: var(--c-btn-bg);
+  color: var(--c-text-dim);
+  transition: background 0.2s, color 0.2s;
+}
+.filter-btn:hover { background: var(--c-btn-hover); }
+.filter-btn.active {
+  background: var(--c-accent);
+  color: #fff;
+}
+
+/* ------------------------------------------------------------------
    Main Content
    ------------------------------------------------------------------ */
 .main-content {
