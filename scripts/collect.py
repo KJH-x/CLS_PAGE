@@ -148,6 +148,16 @@ def r2_list_all() -> dict[str, int]:
     return prefixes
 
 
+def r2_head(key: str) -> bool:
+    """Check if an object exists in R2."""
+    s3 = _get_s3()
+    try:
+        s3.head_object(Bucket=_R2_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+
+
 def r2_get_last_id() -> Optional[str]:
     """Read the last processed dynamic ID from R2."""
     data = r2_get_json(LAST_ID_KEY)
@@ -255,7 +265,7 @@ def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[
 _TAG_RE = re.compile(r"#(\S+?)#")
 
 # Only match dynamics with title pattern: 〓朝陇山{date}｜{name}〓上新
-_TITLE_PATTERN = re.compile(r"〓朝陇山\s*\d{1,2}\s*[A-Z][a-z]+\.?\s*[｜|].*〓上新")
+_TITLE_PATTERN = re.compile(r"〓朝陇山\s*\d{1,2}\s*[A-Z][a-z]+\.?\s*[｜|].*〓(上新|余量上架)")
 
 
 def extract_tags(text: str) -> list[str]:
@@ -311,28 +321,40 @@ def extract_dynamic(item: dict) -> Optional[dict]:
     if not image_urls:
         return None
 
-    # Filter: only keep dynamics matching "〓朝陇山...〓..."
-    if not _TITLE_PATTERN.search(search_text):
+    # Category detection: two patterns
+    #   1) 〓朝陇山{date}｜{name}〓{上新|余量上架}
+    #   2) Plain text with #余量上架# hashtag (no 〓 wrapper)
+    title_match = _TITLE_PATTERN.search(search_text)
+    if title_match:
+        category = title_match.group(1)
+    elif "余量上架" in search_text.replace("#", ""):
+        category = "余量上架"
+    else:
         return None
 
-    # Title: find the line containing the 〓朝陇山...〓上新 pattern
+    # Title: for 〓 pattern, extract the matching line; for 余量上架, use first line
     title = ""
-    for line in search_text.split("\n"):
-        line = line.strip()
-        if _TITLE_PATTERN.search(line):
-            title = strip_tags(line).strip()
-            break
-    if not title:
-        # Fallback: first line with 〓
+    if category == "上新" or (category == "余量上架" and _TITLE_PATTERN.search(search_text)):
+        # Has 〓 pattern — find that line
         for line in search_text.split("\n"):
             line = line.strip()
-            if "〓" in line:
+            if _TITLE_PATTERN.search(line):
                 title = strip_tags(line).strip()
                 break
+        if not title:
+            for line in search_text.split("\n"):
+                line = line.strip()
+                if "〓" in line:
+                    title = strip_tags(line).strip()
+                    break
     if not title:
-        first_line = search_text.split("\n")[0].strip()
-        title = strip_tags(first_line)
-    # Strip "互动抽奖" prefix
+        # Fallback: first non-empty, non-hashtag-only line
+        for line in search_text.split("\n"):
+            line = line.strip()
+            cleaned = strip_tags(line)
+            if cleaned:
+                title = cleaned
+                break
     title = re.sub(r"^互动抽奖\s*", "", title).strip()
     if not title:
         title = "(no title)"
@@ -347,6 +369,7 @@ def extract_dynamic(item: dict) -> Optional[dict]:
         "fullText": search_text,
         "bilibiliUrl": f"https://t.bilibili.com/{dyn_id}",
         "tags": tags,
+        "category": category,
         "imageUrls": image_urls,
     }
 
@@ -499,17 +522,41 @@ def main() -> None:
             candidates.append(info)
 
     candidates.sort(key=lambda d: d["timestamp"])  # oldest first for dedup
-    # Deduplicate: keep the earliest dynamic per activity name
     _ACTIVITY_RE = re.compile(r"[｜|](.+?)〓")
-    seen_activities: set[str] = set()
+    seen_activities: set[tuple] = set()
     deduped: list[dict] = []
     for c in candidates:
         m = _ACTIVITY_RE.search(c["text"])
-        group = m.group(1).strip() if m else c["text"]
-        if group not in seen_activities:
-            seen_activities.add(group)
+        if m:
+            act_name = m.group(1).strip()
+        else:
+            # For non-〓 format (余量上架), use first 40 chars of title as key
+            act_name = c["text"][:40].strip()
+        key = (act_name, c.get("category", ""))
+        if key not in seen_activities:
+            seen_activities.add(key)
             deduped.append(c)
-    log(f"  After dedup (by activity, kept earliest): {len(deduped)} unique activities")
+    log(f"  After dedup (by activity+category, kept earliest): {len(deduped)} unique")
+    deduped.sort(key=lambda d: d["timestamp"], reverse=True)
+
+    # Merge with old dynamics: keep existing ones not refreshed by this fetch
+    merged_ids = {d["id"] for d in deduped}
+    for od in old_dynamics_map.values():
+        if od.get("id") not in merged_ids:
+            # Convert old dynamic format to candidate format
+            old_candidate = {
+                "id": od["id"],
+                "timestamp": od.get("timestamp", 0),
+                "date": od.get("date", ""),
+                "text": od.get("text", ""),
+                "fullText": od.get("fullText", ""),
+                "bilibiliUrl": od.get("bilibiliUrl", ""),
+                "tags": od.get("tags", []),
+                "category": od.get("category", ""),
+                "imageUrls": [],  # will be recovered from old_images_map
+            }
+            deduped.append(old_candidate)
+
     deduped.sort(key=lambda d: d["timestamp"], reverse=True)
     selected = deduped[:_KEEP_RECENT]
     log(f"  Candidates with images: {len(candidates)}")
@@ -570,6 +617,29 @@ def main() -> None:
 
             log(f"  [{dyn['id'][:16]}] img {idx+1}/{len(dyn['imageUrls'])} — processing...")
 
+            # Check if image+thumbnail already exist in R2 (even without manifest)
+            if r2_head(r2_key):
+                log(f"    Already in R2, skipping")
+                # Need thumbnailKey too — check if it exists
+                thumb_key = f"thumbs/{dyn['id']}/{idx}.jpg"
+                meta = {
+                    "index": idx,
+                    "r2Key": r2_key,
+                    "thumbnailKey": thumb_key if r2_head(thumb_key) else "",
+                    "originalWidth": api_w,
+                    "originalHeight": api_h,
+                    "storedWidth": api_w,
+                    "storedHeight": api_h,
+                    "displayWidthScale": 1,
+                    "compressionMode": "original-q35",
+                }
+                images.append(meta)
+                tracked_objects.add(r2_key)
+                if meta["thumbnailKey"]:
+                    tracked_objects.add(meta["thumbnailKey"])
+                stats_recovered += 1
+                continue
+
             raw = download_image(img_url)
             if not raw:
                 stats_fail += 1
@@ -621,6 +691,7 @@ def main() -> None:
             "fullText": dyn["fullText"],
             "bilibiliUrl": dyn["bilibiliUrl"],
             "tags": dyn["tags"],
+            "category": dyn.get("category", ""),
             "imageCount": len(images),
             "images": images,
         }
@@ -650,6 +721,7 @@ def main() -> None:
             "text": d["text"],
             "date": d["date"],
             "tags": d["tags"],
+            "category": d.get("category", ""),
             "imageCount": d["imageCount"],
         })
 
