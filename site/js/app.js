@@ -33,10 +33,30 @@
   }
 
   function initFilterBar() {
-    document.querySelectorAll(".filter-btn").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        setCategory(this.dataset.cat);
-      });
+    if (!appData || !appData.dynamics) return;
+    var bar = document.getElementById("filterBar");
+    bar.innerHTML = "";
+    // Collect unique categories
+    var cats = {};
+    appData.dynamics.forEach(function (d) {
+      var c = d.category || "";
+      if (c) cats[c] = (cats[c] || 0) + 1;
+    });
+    // "全部" first
+    var btn = document.createElement("button");
+    btn.className = "filter-btn active";
+    btn.dataset.cat = "";
+    btn.textContent = "全部";
+    btn.addEventListener("click", function () { setCategory(""); });
+    bar.appendChild(btn);
+    // One per category
+    Object.keys(cats).sort().forEach(function (cat) {
+      var b = document.createElement("button");
+      b.className = "filter-btn";
+      b.dataset.cat = cat;
+      b.textContent = cat;
+      b.addEventListener("click", function () { setCategory(cat); });
+      bar.appendChild(b);
     });
   }
 
@@ -176,8 +196,9 @@
       appData.dynamics = appData.dynamics.map(normalizeDynamic);
       hideLoading();
       setupSearch();
-      checkRoute();          // detect route, may override currentCategory
-      render();              // render with current filter
+      initFilterBar();
+      checkRoute();
+      render();
       if (routeTarget) {
         navigateToDynamic(routeTarget);
       }
@@ -458,9 +479,6 @@
   console.log("[app] init, ARCHIVE_CONFIG:", window.ARCHIVE_CONFIG);
   console.log("[app] R2_BASE:", R2_BASE);
   console.log("[app] PREVIEW_COUNT:", PREVIEW_COUNT, "TILE_HEIGHT:", TILE_HEIGHT);
-
-  initFilterBar();
-  setCategory("上新");
 
   fetchData();
 

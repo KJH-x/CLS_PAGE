@@ -591,10 +591,14 @@ def main() -> None:
             api_h = img_info.get("height", 0)
             r2_key = f"images/{dyn['id']}/{idx}.jpg"
 
-            # Skip square images (e.g. 500x500 icons)
-            if api_w > 0 and api_h > 0 and api_w == api_h:
-                log(f"  [{dyn['id'][:16]}] img {idx} — square ({api_w}x{api_h}), skipped")
-                continue
+            # Skip square images (e.g. 500x500 icons) and banners (aspect > 0.3)
+            if api_w > 0 and api_h > 0:
+                if api_w == api_h:
+                    log(f"  [{dyn['id'][:16]}] img {idx} — square ({api_w}x{api_h}), skipped")
+                    continue
+                if api_w / api_h >= 0.3:
+                    log(f"  [{dyn['id'][:16]}] img {idx} — banner ({api_w}x{api_h}, ratio={api_w/api_h:.2f}), skipped")
+                    continue
 
             # If image already exists in R2, recover metadata from old index
             if r2_key in old_objects and r2_key in old_images_map:
