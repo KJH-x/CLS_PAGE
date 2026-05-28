@@ -19,6 +19,8 @@
 
   // State
   var appData = null;
+  var appData = null;
+  var searchData = null;
   var currentCategory = "";
   var routeTarget = null;
 

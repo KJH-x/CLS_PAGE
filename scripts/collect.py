@@ -265,7 +265,7 @@ def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[
 _TAG_RE = re.compile(r"#(\S+?)#")
 
 # Only match dynamics with title pattern: 〓朝陇山{date}｜{name}〓上新
-_TITLE_PATTERN = re.compile(r"〓朝陇山\s*\d{1,2}\s*[A-Z][a-z]+\.?\s*[｜|].*〓(上新|余量上架)")
+_TITLE_PATTERN = re.compile(r"〓朝陇山\s*\d{1,2}\s*[A-Z][a-z]+\.?\s*[｜|].*〓(上新|余量上架|复刻上新)")
 
 
 def extract_tags(text: str) -> list[str]:
@@ -553,13 +553,16 @@ def main() -> None:
                 "bilibiliUrl": od.get("bilibiliUrl", ""),
                 "tags": od.get("tags", []),
                 "category": od.get("category", ""),
-                "imageUrls": [],  # will be recovered from old_images_map
+                "imageUrls": [
+                    {"url": "", "width": img.get("originalWidth", 0), "height": img.get("originalHeight", 0)}
+                    for img in od.get("images", [])
+                ],
             }
             deduped.append(old_candidate)
 
     deduped.sort(key=lambda d: d["timestamp"], reverse=True)
     selected = deduped[:_KEEP_RECENT]
-    log(f"  Candidates with images: {len(candidates)}")
+    log(f"  Newly extracted: {len(candidates)}, merged from old index: {len(deduped) - len(candidates)}")
     log(f"  Selected (top {_KEEP_RECENT}): {len(selected)}")
 
     if not selected:
