@@ -40,6 +40,12 @@ _R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 _BILI_COOKIE = os.environ.get("BILIBILI_COOKIE", "")
 _BILI_UID = os.environ.get("BILIBILI_UID", "")
 _KEEP_RECENT = int(os.environ.get("KEEP_RECENT", "10"))
+_OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "")
+_DRY_RUN = os.environ.get("DRY_RUN", "") != ""
+_MIN_DEDUP = int(os.environ.get("EXPECTED_MIN_DEDUP_DYNAMICS", "0"))
+_MIN_SURVIVED = int(os.environ.get("EXPECTED_MIN_SURVIVED_DYNAMICS", "0"))
+_MAX_ALL_SKIPPED = int(os.environ.get("EXPECTED_MAX_ALL_IMAGE_SKIPPED", "999"))
+_MIN_IMAGES = int(os.environ.get("EXPECTED_MIN_IMAGES", "0"))
 
 DISPLAY_WIDTH_SCALE = 1  # no horizontal downsampling
 JPEG_QUALITY = 35
@@ -52,6 +58,10 @@ MANIFEST_PREVIOUS_KEY = "manifests/previous.json"
 INDEX_KEY = "site/index.json"
 SEARCH_INDEX_KEY = "site/search-index.json"
 LAST_ID_KEY = "config/last-dynamic-id.json"
+
+def _pk(key: str) -> str:
+    """Apply output prefix if set, otherwise return key unchanged."""
+    return f"{_OUTPUT_PREFIX.rstrip('/')}/{key}" if _OUTPUT_PREFIX else key
 
 # Private R2 client — lazy init
 _s3 = None
@@ -129,6 +139,23 @@ def r2_delete(key: str) -> bool:
     except Exception as exc:
         log(f"    WARN: Failed to delete {key}: {exc}")
         return False
+
+
+def r2_get_bytes(key: str) -> Optional[bytes]:
+    s3 = _get_s3()
+    try:
+        resp = s3.get_object(Bucket=_R2_BUCKET, Key=key)
+        return resp["Body"].read()
+    except Exception:
+        return None
+
+
+def get_image_size(data: bytes) -> tuple[int, int]:
+    try:
+        img = Image.open(io.BytesIO(data))
+        return img.size
+    except Exception:
+        return 0, 0
 
 
 def r2_list_all() -> dict[str, int]:
@@ -316,7 +343,7 @@ def extract_dynamic(item: dict) -> Optional[dict]:
                 image_urls.append({"url": url, "width": pic.get("width", 0), "height": pic.get("height", 0)})
         # Text lives in summary.text; fallback to title
         summary = opus.get("summary") or {}
-        search_text = summary.get("text", "") or opus.get("title", "") or ""
+        search_text = (opus.get("title", "") + " " + summary.get("text", "")).strip()
 
     if not image_urls:
         return None
@@ -539,26 +566,19 @@ def main() -> None:
     log(f"  After dedup (by activity+category, kept earliest): {len(deduped)} unique")
     deduped.sort(key=lambda d: d["timestamp"], reverse=True)
 
-    # Merge with old dynamics: keep existing ones not refreshed by this fetch
+    # Merge with old dynamics: keep existing ones not refreshed by this fetch.
+    # Convert old format (has "images" with full metadata) to new candidate format
+    # so they can be processed without re-downloading.
     merged_ids = {d["id"] for d in deduped}
     for od in old_dynamics_map.values():
         if od.get("id") not in merged_ids:
-            # Convert old dynamic format to candidate format
-            old_candidate = {
-                "id": od["id"],
-                "timestamp": od.get("timestamp", 0),
-                "date": od.get("date", ""),
-                "text": od.get("text", ""),
-                "fullText": od.get("fullText", ""),
-                "bilibiliUrl": od.get("bilibiliUrl", ""),
-                "tags": od.get("tags", []),
-                "category": od.get("category", ""),
-                "imageUrls": [
-                    {"url": "", "width": img.get("originalWidth", 0), "height": img.get("originalHeight", 0)}
-                    for img in od.get("images", [])
-                ],
-            }
-            deduped.append(old_candidate)
+            old_imgs = od.get("images", [])
+            od["imageUrls"] = [
+                {"url": "", "width": img.get("originalWidth", 0), "height": img.get("originalHeight", 0)}
+                for img in old_imgs
+            ]
+            od["_oldImages"] = {img["r2Key"]: img for img in old_imgs if img.get("r2Key")}
+            deduped.append(od)
 
     deduped.sort(key=lambda d: d["timestamp"], reverse=True)
     selected = deduped[:_KEEP_RECENT]
@@ -624,27 +644,45 @@ def main() -> None:
 
             log(f"  [{dyn['id'][:16]}] img {idx+1}/{len(dyn['imageUrls'])} — processing...")
 
-            # Check if image+thumbnail already exist in R2 (even without manifest)
+            # For merged old dynamics: recover metadata directly without downloading
+            old_meta = dyn.get("_oldImages", {}).get(r2_key)
+            if old_meta:
+                old_meta["index"] = idx
+                old_meta["r2Key"] = r2_key
+                images.append(old_meta)
+                tracked_objects.add(r2_key)
+                tk = old_meta.get("thumbnailKey", "")
+                if tk:
+                    tracked_objects.add(tk)
+                stats_recovered += 1
+                log(f"    Recovered from old index metadata")
+                continue
+
+            # Check if image already exists in R2 — recover actual dimensions
             if r2_head(r2_key):
-                log(f"    Already in R2, skipping")
-                # Need thumbnailKey too — check if it exists
+                existing_bytes = r2_get_bytes(r2_key)
+                stored_w, stored_h = get_image_size(existing_bytes or b"")
+                if stored_w <= 0 or stored_h <= 0:
+                    stored_w, stored_h = api_w, api_h
                 thumb_key = f"thumbs/{dyn['id']}/{idx}.jpg"
+                thumb_exists = r2_head(thumb_key)
                 meta = {
                     "index": idx,
                     "r2Key": r2_key,
-                    "thumbnailKey": thumb_key if r2_head(thumb_key) else "",
-                    "originalWidth": api_w,
-                    "originalHeight": api_h,
-                    "storedWidth": api_w,
-                    "storedHeight": api_h,
-                    "displayWidthScale": 1,
-                    "compressionMode": "original-q35",
+                    "thumbnailKey": thumb_key if thumb_exists else "",
+                    "originalWidth": max(api_w, stored_w),
+                    "originalHeight": max(api_h, stored_h),
+                    "storedWidth": stored_w,
+                    "storedHeight": stored_h,
+                    "displayWidthScale": DISPLAY_WIDTH_SCALE,
+                    "compressionMode": "recovered-from-r2",
                 }
                 images.append(meta)
                 tracked_objects.add(r2_key)
                 if meta["thumbnailKey"]:
                     tracked_objects.add(meta["thumbnailKey"])
                 stats_recovered += 1
+                log(f"    Recovered from R2 ({stored_w}x{stored_h})")
                 continue
 
             raw = download_image(img_url)
@@ -710,14 +748,41 @@ def main() -> None:
         log("WARNING: No dynamics with valid images after processing. Aborting to preserve existing index.")
         sys.exit(0)
 
+    all_image_skipped = len([d for d in selected if d["id"] not in {e["id"] for e in dynamics_data}])
+    total_imgs = sum(d["imageCount"] for d in dynamics_data)
+
+    if _MIN_DEDUP and len(selected) < _MIN_DEDUP:
+        log(f"ABORT: dedup dynamics {len(selected)} < {_MIN_DEDUP}")
+        sys.exit(1)
+    if _MAX_ALL_SKIPPED < 999 and all_image_skipped > _MAX_ALL_SKIPPED:
+        log(f"ABORT: too many all-image-skipped dynamics: {all_image_skipped} > {_MAX_ALL_SKIPPED}")
+        sys.exit(1)
+    if _MIN_SURVIVED and len(dynamics_data) < _MIN_SURVIVED:
+        log(f"ABORT: survived dynamics {len(dynamics_data)} < {_MIN_SURVIVED}")
+        sys.exit(1)
+    if _MIN_IMAGES and total_imgs < _MIN_IMAGES:
+        log(f"ABORT: image count {total_imgs} < {_MIN_IMAGES}")
+        sys.exit(1)
+    if stats_fail > 0:
+        log(f"ABORT: image failures detected: {stats_fail}")
+        sys.exit(1)
+
+    # Orphan check: report R2 images not referenced by new index
+    r2_img_keys = {k for k in old_objects if k.startswith("images/")}
+    referenced = {img["r2Key"] for d in dynamics_data for img in d["images"]}
+    orphans = sorted(r2_img_keys - referenced)
+    log(f"  Orphan R2 images (not referenced): {len(orphans)} / {len(r2_img_keys)}")
+    for k in orphans:
+        log(f"    ORPHAN {k}")
+
     # ---- 5. Build & upload index files ---------------------------------------
-    log("[Step 5] Building & uploading index files...")
+    log(f"[Step 5] Building & uploading index files...  (prefix: '{_OUTPUT_PREFIX or '(production)'}')")
 
     index_data: dict = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "keepRecent": _KEEP_RECENT,
         "totalDynamics": len(dynamics_data),
-        "totalImages": sum(d["imageCount"] for d in dynamics_data),
+        "totalImages": total_imgs,
         "dynamics": dynamics_data,
     }
 
@@ -732,11 +797,11 @@ def main() -> None:
             "imageCount": d["imageCount"],
         })
 
-    r2_put_json(INDEX_KEY, index_data)
-    log(f"  Uploaded {INDEX_KEY}  ({len(dynamics_data)} dynamics, {index_data['totalImages']} images)")
+    r2_put_json(_pk(INDEX_KEY), index_data)
+    log(f"  Uploaded {_pk(INDEX_KEY)}  ({len(dynamics_data)} dynamics, {index_data['totalImages']} images)")
 
-    r2_put_json(SEARCH_INDEX_KEY, search_index)
-    log(f"  Uploaded {SEARCH_INDEX_KEY}  ({len(search_index)} entries)")
+    r2_put_json(_pk(SEARCH_INDEX_KEY), search_index)
+    log(f"  Uploaded {_pk(SEARCH_INDEX_KEY)}  ({len(search_index)} entries)")
 
     # ---- 6. Build & upload manifest ------------------------------------------
     log("[Step 6] Building & uploading manifests...")
@@ -749,15 +814,15 @@ def main() -> None:
         "objects": sorted(tracked_objects),
     }
 
-    r2_put_json(MANIFEST_CURRENT_KEY, new_manifest)
-    log(f"  Uploaded {MANIFEST_CURRENT_KEY}")
+    r2_put_json(_pk(MANIFEST_CURRENT_KEY), new_manifest)
+    log(f"  Uploaded {_pk(MANIFEST_CURRENT_KEY)}")
 
     if old_manifest:
-        r2_put_json(MANIFEST_PREVIOUS_KEY, old_manifest)
-        log(f"  Uploaded {MANIFEST_PREVIOUS_KEY} (backup)")
+        r2_put_json(_pk(MANIFEST_PREVIOUS_KEY), old_manifest)
+        log(f"  Uploaded {_pk(MANIFEST_PREVIOUS_KEY)} (backup)")
 
     # ---- 7. Save last-dynamic-id for incremental runs ------------------------
-    if newest_id and dynamics_data:
+    if newest_id and dynamics_data and not _OUTPUT_PREFIX:
         r2_put_last_id(newest_id)
         log(f"  Saved last-dynamic-id: {newest_id[:16]}...")
     else:
