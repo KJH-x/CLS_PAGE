@@ -64,15 +64,24 @@ pip install -r scripts/requirements.txt
 | `BILIBILI_COOKIE` | Bilibili cookie string (`key=val; key=val; ...`) |
 | `BILIBILI_UID` | Target Bilibili user ID |
 | `KEEP_RECENT` | Max dynamics to keep in index (default 10) |
+| `OUTPUT_PREFIX` | Optional isolated R2 namespace for staging runs |
+| `DRY_RUN` | If non-empty, perform reads/downloads but skip every R2 write |
+| `ALLOW_IMAGE_FAILURES` | Maximum tolerated image failures before aborting (default 0) |
+| `REQUEST_MAX_ATTEMPTS` | Attempts for transient API/image failures (default 3) |
+| `BACKOFF_BASE_SECONDS` | Base delay for exponential retry backoff (default 1) |
 
 ### Incremental Run (default)
 
 When `config/last-dynamic-id.json` exists in R2, the script stops fetching when it hits that ID. Only new dynamics are processed; existing images in R2 are recovered without re-downloading.
 
 ```bash
-# Set env vars, then:
-python scripts/collect.py
+# Preserve the full existing archive while appending new dynamics:
+KEEP_RECENT=999 python scripts/collect.py
 ```
+
+On PowerShell use `$env:KEEP_RECENT = "999"` before invoking the script. The collector does not
+advance its cursor when the API fails, stalls, or reaches the pagination cap before the previous
+cursor. Use `DRY_RUN=1` to exercise the full pipeline without changing R2.
 
 ### Full Scan
 

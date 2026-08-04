@@ -1,0 +1,15 @@
+/*
+  Content-Security-Policy: default-src 'self'; connect-src 'self' https://cls.r2.nsapi.top; img-src 'self' data: https://cls.r2.nsapi.top; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/*.js
+  Cache-Control: public, max-age=300, must-revalidate
+
+/*.css
+  Cache-Control: public, max-age=300, must-revalidate

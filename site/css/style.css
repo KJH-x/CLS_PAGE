@@ -551,7 +551,10 @@ input { font-family: inherit; }
 
 .lb-thumb {
   width: 48px; height: 48px;
+  padding: 0;
   border-radius: 4px;
+  background: transparent;
+  appearance: none;
   overflow: hidden;
   cursor: pointer;
   border: 2px solid transparent;
@@ -559,6 +562,7 @@ input { font-family: inherit; }
   opacity: 0.5;
   transition: opacity 0.2s, border-color 0.2s;
 }
+.lb-thumb:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
 .lb-thumb:hover { opacity: 0.8; }
 .lb-thumb.active { border-color: #fff; opacity: 1; }
 .lb-thumb img {

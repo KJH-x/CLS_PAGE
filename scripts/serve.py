@@ -25,10 +25,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         print(f"[{self.log_date_time_string()}] {args[0]}")
 
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
 if __name__ == "__main__":
     print(f"Serving {DIR}")
     print(f"Open http://localhost:{PORT}")
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+    with ReusableTCPServer(("", PORT), Handler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

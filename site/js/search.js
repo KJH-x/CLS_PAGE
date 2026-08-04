@@ -28,7 +28,7 @@
     clearBtn.hidden = false;
 
     if (!searchIndex || !searchIndex.length) {
-      statusEl.textContent = "No index loaded";
+      statusEl.textContent = "搜索索引未加载";
       noResults.hidden = true;
       return;
     }

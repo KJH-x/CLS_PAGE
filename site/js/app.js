@@ -19,9 +19,9 @@
 
   // State
   var appData = null;
-  var appData = null;
   var searchData = null;
   var currentCategory = "";
+  var activeSearchIds = null;
   var routeTarget = null;
 
   function setCategory(cat) {
@@ -29,7 +29,7 @@
     document.querySelectorAll(".filter-btn").forEach(function (btn) {
       btn.classList.toggle("active", btn.dataset.cat === cat);
     });
-    render();
+    render(activeSearchIds);
   }
 
   function initFilterBar() {
@@ -82,8 +82,6 @@
   // ------------------------------------------------------------------
   // Routing — open a specific dynamic via URL
   // ------------------------------------------------------------------
-  var routeTarget = null; // dynamic to open after render
-
   function checkRoute() {
     if (!appData || !appData.dynamics) return;
 
@@ -92,7 +90,11 @@
 
     var pathMatch = window.location.pathname.match(/\/to\/(.+?)\/?$/);
     if (pathMatch) {
-      targetActivity = decodeURIComponent(pathMatch[1]);
+      try {
+        targetActivity = decodeURIComponent(pathMatch[1]);
+      } catch (err) {
+        console.warn("Ignoring malformed archive route", err);
+      }
     }
 
     var hashMatch = window.location.hash.match(/^#id-(.+)$/);
@@ -228,9 +230,6 @@
     var visibleDynamics = dynamics;
     if (searchFilterIds) {
       visibleDynamics = dynamics.filter(function (d) { return searchFilterIds.has(d.id); });
-      noResults.hidden = visibleDynamics.length > 0;
-    } else {
-      noResults.hidden = true;
     }
 
     if (currentCategory) {
@@ -238,6 +237,8 @@
         return (d.category || "") === currentCategory;
       });
     }
+
+    noResults.hidden = !(searchFilterIds || currentCategory) || visibleDynamics.length > 0;
 
     timeline.innerHTML = "";
 
@@ -458,6 +459,7 @@
   function setupSearch() {
     window.initSearch(searchData || [], function (filterIds) {
       if (!appData) return;
+      activeSearchIds = filterIds;
       if (filterIds === null) {
         render(null);
         document.getElementById("noResults").hidden = true;

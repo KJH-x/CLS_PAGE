@@ -2,14 +2,15 @@
 """Bilibili Dynamic Image Archiver — collects, compresses, and uploads to Cloudflare R2.
 
 Data flow:
-  1. Load manifest from R2 (current.json) as old baseline
-  2. Fetch Bilibili user dynamics via API (paginated)
-  3. Extract dynamics that contain images
-  4. Download original images, compress (1/3 width, q35 JPEG), upload to R2
-  5. Generate index.json + search-index.json + new manifest
-  6. Upload manifests/current.json, then delete stale R2 objects from old manifest
+  1. Load the current manifest and index from R2
+  2. Fetch Bilibili user dynamics via the paginated API
+  3. Extract, merge, and deduplicate dynamics that contain images
+  4. Download originals, compress at original width (q35 JPEG), and upload images
+  5. After all integrity gates pass, upload the index and search index
+  6. Upload the current manifest and retain the previous manifest as a backup
 
-On failure before step 6 completes, the previous index.json remains intact → no broken site.
+Images are uploaded before the index, and stale-object cleanup is deliberately disabled. A failed
+run can therefore leave unreferenced objects, but it cannot publish an index with missing new images.
 """
 
 from __future__ import annotations
@@ -17,12 +18,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import random
 import re
 import sys
 import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import boto3
 import requests
@@ -30,8 +33,23 @@ from botocore.config import Config
 from PIL import Image, UnidentifiedImageError
 
 # ---------------------------------------------------------------------------
-# Runtime configuration (overridden in main for real runs)
+# Runtime configuration
 # ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: str) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer") from exc
+
+
+def _env_float(name: str, default: str) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number") from exc
+
 
 _R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY_ID", "")
 _R2_SECRET_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
@@ -39,19 +57,25 @@ _R2_BUCKET = os.environ.get("R2_BUCKET", "")
 _R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 _BILI_COOKIE = os.environ.get("BILIBILI_COOKIE", "")
 _BILI_UID = os.environ.get("BILIBILI_UID", "")
-_KEEP_RECENT = int(os.environ.get("KEEP_RECENT", "10"))
+_KEEP_RECENT = _env_int("KEEP_RECENT", "10")
 _OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "")
 _DRY_RUN = os.environ.get("DRY_RUN", "") != ""
-_MIN_DEDUP = int(os.environ.get("EXPECTED_MIN_DEDUP_DYNAMICS", "0"))
-_MIN_SURVIVED = int(os.environ.get("EXPECTED_MIN_SURVIVED_DYNAMICS", "0"))
-_MAX_ALL_SKIPPED = int(os.environ.get("EXPECTED_MAX_ALL_IMAGE_SKIPPED", "999"))
-_MIN_IMAGES = int(os.environ.get("EXPECTED_MIN_IMAGES", "0"))
+_MIN_DEDUP = _env_int("EXPECTED_MIN_DEDUP_DYNAMICS", "0")
+_MIN_SURVIVED = _env_int("EXPECTED_MIN_SURVIVED_DYNAMICS", "0")
+_MAX_ALL_SKIPPED = _env_int("EXPECTED_MAX_ALL_IMAGE_SKIPPED", "999")
+_MIN_IMAGES = _env_int("EXPECTED_MIN_IMAGES", "0")
+_MAX_IMAGE_FAILURES = _env_int("ALLOW_IMAGE_FAILURES", "0")
+_REQUEST_MAX_ATTEMPTS = _env_int("REQUEST_MAX_ATTEMPTS", "3")
+_BACKOFF_BASE_SECONDS = _env_float("BACKOFF_BASE_SECONDS", "1")
+_API_PAGE_DELAY_SECONDS = _env_float("API_PAGE_DELAY_SECONDS", "0.4")
+_IMAGE_DELAY_SECONDS = _env_float("IMAGE_DELAY_SECONDS", "0.15")
 
 DISPLAY_WIDTH_SCALE = 1  # no horizontal downsampling
 JPEG_QUALITY = 35
 THUMB_QUALITY = 40
 THUMB_SCALE = 2  # thumbnail = 1/2 original width & height
 MAX_API_PAGES = 20
+DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 MANIFEST_CURRENT_KEY = "manifests/current.json"
 MANIFEST_PREVIOUS_KEY = "manifests/previous.json"
@@ -62,6 +86,34 @@ LAST_ID_KEY = "config/last-dynamic-id.json"
 def _pk(key: str) -> str:
     """Apply output prefix if set, otherwise return key unchanged."""
     return f"{_OUTPUT_PREFIX.rstrip('/')}/{key}" if _OUTPUT_PREFIX else key
+
+
+def validate_environment() -> None:
+    """Fail before any network access when required configuration is invalid."""
+    required = {
+        "R2_ACCESS_KEY_ID": _R2_ACCESS_KEY,
+        "R2_SECRET_ACCESS_KEY": _R2_SECRET_KEY,
+        "R2_BUCKET": _R2_BUCKET,
+        "R2_ACCOUNT_ID": _R2_ACCOUNT_ID,
+        "BILIBILI_COOKIE": _BILI_COOKIE,
+        "BILIBILI_UID": _BILI_UID,
+    }
+    missing = [name for name, value in required.items() if not value.strip()]
+    if missing:
+        raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
+    if not _BILI_UID.isdigit():
+        raise SystemExit("BILIBILI_UID must contain digits only")
+    if _KEEP_RECENT <= 0:
+        raise SystemExit("KEEP_RECENT must be greater than zero")
+    if _MAX_IMAGE_FAILURES < 0:
+        raise SystemExit("ALLOW_IMAGE_FAILURES cannot be negative")
+    if _REQUEST_MAX_ATTEMPTS <= 0:
+        raise SystemExit("REQUEST_MAX_ATTEMPTS must be greater than zero")
+    if any(value < 0 for value in (_BACKOFF_BASE_SECONDS, _API_PAGE_DELAY_SECONDS, _IMAGE_DELAY_SECONDS)):
+        raise SystemExit("Retry and request delay values cannot be negative")
+    prefix_parts = [part for part in _OUTPUT_PREFIX.replace("\\", "/").split("/") if part]
+    if _OUTPUT_PREFIX.startswith(("/", "\\")) or ".." in prefix_parts:
+        raise SystemExit("OUTPUT_PREFIX must be a relative R2 key prefix")
 
 # Private R2 client — lazy init
 _s3 = None
@@ -107,6 +159,9 @@ def r2_get_json(key: str) -> Optional[dict]:
 
 def r2_put_json(key: str, data: Any, cache_max_age: int = 300) -> None:
     """Upload a JSON-serialisable object to R2."""
+    if _DRY_RUN:
+        log(f"  DRY RUN: would upload {key}")
+        return
     s3 = _get_s3()
     body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     s3.put_object(
@@ -120,6 +175,9 @@ def r2_put_json(key: str, data: Any, cache_max_age: int = 300) -> None:
 
 def r2_put_image(key: str, data: bytes) -> None:
     """Upload a JPEG image to R2 with long-lived cache."""
+    if _DRY_RUN:
+        log(f"  DRY RUN: would upload {key} ({len(data):,} bytes)")
+        return
     s3 = _get_s3()
     s3.put_object(
         Bucket=_R2_BUCKET,
@@ -132,6 +190,9 @@ def r2_put_image(key: str, data: bytes) -> None:
 
 def r2_delete(key: str) -> bool:
     """Delete a single object from R2. Returns True on success."""
+    if _DRY_RUN:
+        log(f"  DRY RUN: would delete {key}")
+        return True
     s3 = _get_s3()
     try:
         s3.delete_object(Bucket=_R2_BUCKET, Key=key)
@@ -187,13 +248,13 @@ def r2_head(key: str) -> bool:
 
 def r2_get_last_id() -> Optional[str]:
     """Read the last processed dynamic ID from R2."""
-    data = r2_get_json(LAST_ID_KEY)
+    data = r2_get_json(_pk(LAST_ID_KEY))
     return data.get("lastDynamicId") if data else None
 
 
 def r2_put_last_id(dyn_id: str) -> None:
     """Store the last processed dynamic ID on R2."""
-    r2_put_json(LAST_ID_KEY, {"lastDynamicId": dyn_id})
+    r2_put_json(_pk(LAST_ID_KEY), {"lastDynamicId": dyn_id})
 
 
 # ---------------------------------------------------------------------------
@@ -220,14 +281,54 @@ BILI_HEADERS_TEMPLATE: dict[str, str] = {
 }
 
 
-def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[str]]:
+def _retry_delay(attempt: int, retry_after: Optional[str] = None) -> float:
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            pass
+    return _BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+
+
+def _request_with_retry(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: int,
+    label: str,
+) -> Optional[requests.Response]:
+    """GET a URL with bounded retry/backoff for transient network and HTTP failures."""
+    for attempt in range(1, _REQUEST_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            if response.status_code == 429 or response.status_code >= 500:
+                raise requests.HTTPError(
+                    f"transient HTTP {response.status_code}", response=response
+                )
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            if attempt >= _REQUEST_MAX_ATTEMPTS:
+                log(f"  ERROR: {label} failed after {attempt} attempts: {exc}")
+                return None
+            response = getattr(exc, "response", None)
+            retry_after = response.headers.get("Retry-After") if response is not None else None
+            delay = _retry_delay(attempt, retry_after)
+            log(f"  WARN: {label} attempt {attempt} failed; retrying in {delay:.1f}s")
+            time.sleep(delay)
+    return None
+
+
+def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[str], bool]:
     """Paginate through the user's dynamic feed. If last_id is provided, stop
     when that ID is encountered (incremental mode).
-    Returns (items, newest_id) where newest_id is the first item's ID."""
+    Returns (items, newest_id, pagination_complete). The last flag is false after API failures,
+    stalled offsets, or when MAX_API_PAGES is exhausted before reaching the cursor/feed end."""
     all_items: list[dict] = []
     newest_id: Optional[str] = None
     offset = ""
     page = 0
+    pagination_complete = False
 
     while page < MAX_API_PAGES:
         page += 1
@@ -235,25 +336,39 @@ def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[
         url = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?{params}"
         log(f"  Page {page}  offset={offset[:32] if offset else '(initial)'}")
 
-        try:
-            resp = requests.get(url, headers=_bili_headers(), timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as exc:
-            log(f"  ERROR: API request failed: {exc}")
-            break
+        data: Optional[dict] = None
+        for api_attempt in range(1, _REQUEST_MAX_ATTEMPTS + 1):
+            resp = _request_with_retry(
+                url, headers=_bili_headers(), timeout=30, label="Bilibili API request"
+            )
+            if resp is None:
+                break
+            try:
+                candidate_data = resp.json()
+            except requests.JSONDecodeError as exc:
+                log(f"  ERROR: Bilibili API returned invalid JSON: {exc}")
+                break
 
-        code = data.get("code")
-        if code != 0:
-            log(f"  API returned code={code} message={data.get('message', '')}")
-            if code == -352:
-                log("  ERROR: Captcha / risk-control triggered — cookie may be invalid.")
+            code = candidate_data.get("code")
+            if code == 0:
+                data = candidate_data
+                break
+            log(f"  API returned code={code} message={candidate_data.get('message', '')}")
+            if code not in (-352, -412) or api_attempt >= _REQUEST_MAX_ATTEMPTS:
+                break
+            delay = _retry_delay(api_attempt)
+            log(f"  WARN: Bilibili risk control response; retrying in {delay:.1f}s")
+            time.sleep(delay)
+
+        if data is None:
+            log("  ERROR: Bilibili API page could not be fetched; pagination is incomplete.")
             break
 
         page_data = data.get("data", {})
         items = page_data.get("items") or []
         if not items:
             log("  No more items.")
+            pagination_complete = True
             break
 
         # Check for last_id → stop when we hit already-processed content
@@ -269,20 +384,26 @@ def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[
                 newest_id = item_id
 
         if stop_early:
+            pagination_complete = True
             break
 
         has_more = page_data.get("has_more", False)
         if not has_more:
             log("  has_more=false, stopping pagination.")
+            pagination_complete = True
             break
 
         next_offset = page_data.get("offset", "")
         if not next_offset or next_offset == offset:
-            log("  Offset did not advance, stopping.")
+            log("  WARN: Offset did not advance; pagination is incomplete.")
             break
         offset = next_offset
+        if _API_PAGE_DELAY_SECONDS:
+            time.sleep(_API_PAGE_DELAY_SECONDS)
 
-    return all_items, newest_id
+    if not pagination_complete and page >= MAX_API_PAGES:
+        log(f"  WARN: Reached MAX_API_PAGES={MAX_API_PAGES} before the cursor/feed end; cursor will not advance.")
+    return all_items, newest_id, pagination_complete
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +424,35 @@ def strip_tags(text: str) -> str:
     return _TAG_RE.sub("", text).strip()
 
 
+def coerce_timestamp(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def format_archive_date(timestamp: Any) -> str:
+    value = coerce_timestamp(timestamp)
+    if value <= 0:
+        return ""
+    return datetime.fromtimestamp(value, DISPLAY_TIMEZONE).strftime("%Y-%m-%d")
+
+
+def archived_image_inputs(images: list[dict]) -> list[dict]:
+    """Preserve sparse R2 keys when an old index entry is merged without API image URLs."""
+    return [
+        {
+            "url": "",
+            "width": image.get("originalWidth", 0),
+            "height": image.get("originalHeight", 0),
+            "r2Key": image.get("r2Key", ""),
+            "_oldMeta": dict(image),
+        }
+        for image in images
+        if image.get("r2Key")
+    ]
+
+
 def extract_dynamic(item: dict) -> Optional[dict]:
     """Convert a raw Bilibili dynamic item into our internal format.
     Returns None if the dynamic has no usable images or doesn't match filters."""
@@ -317,9 +467,8 @@ def extract_dynamic(item: dict) -> Optional[dict]:
     if not dyn_id:
         return None
 
-    pub_ts = mod_auth.get("pub_ts", 0)
-    pub_time = mod_auth.get("pub_time", "")
-    if not pub_ts:
+    pub_ts = coerce_timestamp(mod_auth.get("pub_ts", 0))
+    if pub_ts <= 0:
         return None
 
     major = mod_dyn.get("major") or {}
@@ -391,7 +540,7 @@ def extract_dynamic(item: dict) -> Optional[dict]:
     return {
         "id": dyn_id,
         "timestamp": pub_ts,
-        "date": pub_time,
+        "date": format_archive_date(pub_ts),
         "text": title,
         "fullText": search_text,
         "bilibiliUrl": f"https://t.bilibili.com/{dyn_id}",
@@ -417,14 +566,16 @@ IMG_DL_HEADERS = {
 
 def download_image(url: str) -> Optional[bytes]:
     """Download raw image bytes from the given URL."""
-    clean_url = re.sub(r"@\d+w.*$", "", url)  # strip Bilibili size suffix for max res
-    try:
-        resp = requests.get(clean_url, headers=IMG_DL_HEADERS, timeout=60)
-        resp.raise_for_status()
-        return resp.content
-    except Exception as exc:
-        log(f"      Download error: {exc}")
+    if not url:
+        log("      Download error: image URL is empty")
         return None
+    clean_url = re.sub(r"@\d+w.*$", "", url)  # strip Bilibili size suffix for max res
+    resp = _request_with_retry(clean_url, headers=IMG_DL_HEADERS, timeout=60, label="image download")
+    if resp is None:
+        return None
+    if _IMAGE_DELAY_SECONDS:
+        time.sleep(_IMAGE_DELAY_SECONDS)
+    return resp.content
 
 
 def compress_image(raw: bytes) -> Optional[tuple[bytes, dict]]:
@@ -494,11 +645,14 @@ def make_thumbnail(raw: bytes) -> Optional[bytes]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    validate_environment()
     log("=" * 60)
     log("Bilibili Dynamic Archiver — Cloudflare R2 edition")
     log(f"  UID        : {_BILI_UID}")
     log(f"  KEEP_RECENT: {_KEEP_RECENT}")
     log(f"  R2 bucket  : {_R2_BUCKET}")
+    log(f"  Prefix     : {_OUTPUT_PREFIX or '(production)'}")
+    log(f"  Dry run    : {_DRY_RUN}")
     log("=" * 60)
 
     # ---- 0. Check R2 state ---------------------------------------------------
@@ -514,18 +668,22 @@ def main() -> None:
 
     # ---- 1. Load previous state ---------------------------------------------
     log("[Step 1] Loading previous state...")
-    old_manifest = r2_get_json(MANIFEST_CURRENT_KEY)
+    old_manifest = r2_get_json(_pk(MANIFEST_CURRENT_KEY))
     old_objects: set[str] = set()
     old_index: Optional[dict] = None
     if old_manifest:
         old_objects = set(old_manifest.get("objects", []))
         log(f"  Found previous manifest with {len(old_objects)} objects.")
 
-    old_index = r2_get_json(INDEX_KEY)
+    old_index = r2_get_json(_pk(INDEX_KEY))
     old_dynamics_map: dict[str, dict] = {}
     old_images_map: dict[str, dict] = {}
     if old_index:
         for od in old_index.get("dynamics", []):
+            od["timestamp"] = coerce_timestamp(od.get("timestamp"))
+            normalized_date = format_archive_date(od["timestamp"])
+            if normalized_date:
+                od["date"] = normalized_date
             old_dynamics_map[od.get("id", "")] = od
             for oi in od.get("images", []):
                 old_images_map[oi.get("r2Key", "")] = oi
@@ -535,10 +693,13 @@ def main() -> None:
 
     # ---- 2. Fetch dynamics ---------------------------------------------------
     log("[Step 2] Fetching Bilibili dynamics...")
-    raw_items, newest_id = fetch_dynamics(last_id)
+    raw_items, newest_id, pagination_complete = fetch_dynamics(last_id)
     log(f"  Fetched {len(raw_items)} raw items total.")
     if newest_id:
         log(f"  Newest dynamic ID: {newest_id[:16]}...")
+    if not pagination_complete and not raw_items:
+        log("ABORT: Bilibili pagination failed before any items were fetched; existing index is unchanged.")
+        sys.exit(1)
 
     # ---- 3. Extract candidates -----------------------------------------------
     log("[Step 3] Extracting dynamics with images...")
@@ -570,19 +731,30 @@ def main() -> None:
     # Convert old format (has "images" with full metadata) to new candidate format
     # so they can be processed without re-downloading.
     merged_ids = {d["id"] for d in deduped}
+    merged_from_old = 0
     for od in old_dynamics_map.values():
         if od.get("id") not in merged_ids:
             old_imgs = od.get("images", [])
-            od["imageUrls"] = [
-                {"url": "", "width": img.get("originalWidth", 0), "height": img.get("originalHeight", 0)}
-                for img in old_imgs
-            ]
+            od["imageUrls"] = archived_image_inputs(old_imgs)
             od["_oldImages"] = {img["r2Key"]: img for img in old_imgs if img.get("r2Key")}
             deduped.append(od)
+            merged_from_old += 1
 
-    deduped.sort(key=lambda d: d["timestamp"], reverse=True)
+    # Re-apply activity/category dedup after merging old entries. Otherwise an older archived
+    # activity and a newly fetched duplicate can both survive despite the initial candidate dedup.
+    deduped.sort(key=lambda d: d["timestamp"])
+    seen_activities.clear()
+    merged_deduped: list[dict] = []
+    for dynamic in deduped:
+        match = _ACTIVITY_RE.search(dynamic["text"])
+        activity = match.group(1).strip() if match else dynamic["text"][:40].strip()
+        key = (activity, dynamic.get("category", ""))
+        if key not in seen_activities:
+            seen_activities.add(key)
+            merged_deduped.append(dynamic)
+    deduped = sorted(merged_deduped, key=lambda d: d["timestamp"], reverse=True)
     selected = deduped[:_KEEP_RECENT]
-    log(f"  Newly extracted: {len(candidates)}, merged from old index: {len(deduped) - len(candidates)}")
+    log(f"  Newly extracted: {len(candidates)}, merged from old index: {merged_from_old}")
     log(f"  Selected (top {_KEEP_RECENT}): {len(selected)}")
 
     if not selected:
@@ -593,11 +765,11 @@ def main() -> None:
     log("[Step 4] Processing images...")
     dynamics_data: list[dict] = []
     tracked_objects: set[str] = {
-        INDEX_KEY,
-        SEARCH_INDEX_KEY,
-        MANIFEST_CURRENT_KEY,
-        MANIFEST_PREVIOUS_KEY,
-        LAST_ID_KEY,
+        _pk(INDEX_KEY),
+        _pk(SEARCH_INDEX_KEY),
+        _pk(MANIFEST_CURRENT_KEY),
+        _pk(MANIFEST_PREVIOUS_KEY),
+        _pk(LAST_ID_KEY),
     }
     stats_new = 0
     stats_fail = 0
@@ -609,7 +781,7 @@ def main() -> None:
             img_url = img_info["url"]
             api_w = img_info.get("width", 0)
             api_h = img_info.get("height", 0)
-            r2_key = f"images/{dyn['id']}/{idx}.jpg"
+            r2_key = img_info.get("r2Key") or _pk(f"images/{dyn['id']}/{idx}.jpg")
 
             # Skip square images (e.g. 500x500 icons) and banners (aspect > 0.3)
             if api_w > 0 and api_h > 0:
@@ -621,12 +793,16 @@ def main() -> None:
                     continue
 
             # If image already exists in R2, recover metadata from old index
-            if r2_key in old_objects and r2_key in old_images_map:
+            if r2_key in old_objects and r2_key in old_images_map and r2_head(r2_key):
                 old_meta = old_images_map[r2_key]
+                old_thumb_key = old_meta.get("thumbnailKey", "")
+                if old_thumb_key and not r2_head(old_thumb_key):
+                    log(f"  [{dyn['id'][:16]}] img {idx} — thumbnail missing; using full image fallback")
+                    old_thumb_key = ""
                 meta = {
                     "index": idx,
                     "r2Key": r2_key,
-                    "thumbnailKey": old_meta.get("thumbnailKey", ""),
+                    "thumbnailKey": old_thumb_key,
                     "originalWidth": old_meta.get("originalWidth", 0),
                     "originalHeight": old_meta.get("originalHeight", 0),
                     "storedWidth": old_meta.get("storedWidth", 0),
@@ -645,10 +821,14 @@ def main() -> None:
             log(f"  [{dyn['id'][:16]}] img {idx+1}/{len(dyn['imageUrls'])} — processing...")
 
             # For merged old dynamics: recover metadata directly without downloading
-            old_meta = dyn.get("_oldImages", {}).get(r2_key)
-            if old_meta:
+            old_meta = img_info.get("_oldMeta") or dyn.get("_oldImages", {}).get(r2_key)
+            if old_meta and r2_head(r2_key):
+                old_meta = dict(old_meta)
                 old_meta["index"] = idx
                 old_meta["r2Key"] = r2_key
+                old_thumb_key = old_meta.get("thumbnailKey", "")
+                if old_thumb_key and not r2_head(old_thumb_key):
+                    old_meta["thumbnailKey"] = ""
                 images.append(old_meta)
                 tracked_objects.add(r2_key)
                 tk = old_meta.get("thumbnailKey", "")
@@ -664,7 +844,7 @@ def main() -> None:
                 stored_w, stored_h = get_image_size(existing_bytes or b"")
                 if stored_w <= 0 or stored_h <= 0:
                     stored_w, stored_h = api_w, api_h
-                thumb_key = f"thumbs/{dyn['id']}/{idx}.jpg"
+                thumb_key = _pk(f"thumbs/{dyn['id']}/{idx}.jpg")
                 thumb_exists = r2_head(thumb_key)
                 meta = {
                     "index": idx,
@@ -700,7 +880,7 @@ def main() -> None:
             meta["r2Key"] = r2_key
 
             # Generate and upload thumbnail
-            thumb_key = f"thumbs/{dyn['id']}/{idx}.jpg"
+            thumb_key = _pk(f"thumbs/{dyn['id']}/{idx}.jpg")
             thumb_data = make_thumbnail(raw)
             if thumb_data:
                 r2_put_image(thumb_key, thumb_data)
@@ -763,12 +943,13 @@ def main() -> None:
     if _MIN_IMAGES and total_imgs < _MIN_IMAGES:
         log(f"ABORT: image count {total_imgs} < {_MIN_IMAGES}")
         sys.exit(1)
-    if stats_fail > 0:
-        log(f"ABORT: image failures detected: {stats_fail}")
+    if stats_fail > _MAX_IMAGE_FAILURES:
+        log(f"ABORT: image failures detected: {stats_fail} > allowed {_MAX_IMAGE_FAILURES}")
         sys.exit(1)
 
     # Orphan check: report R2 images not referenced by new index
-    r2_img_keys = {k for k in old_objects if k.startswith("images/")}
+    image_prefix = _pk("images/")
+    r2_img_keys = {k for k in old_objects if k.startswith(image_prefix)}
     referenced = {img["r2Key"] for d in dynamics_data for img in d["images"]}
     orphans = sorted(r2_img_keys - referenced)
     log(f"  Orphan R2 images (not referenced): {len(orphans)} / {len(r2_img_keys)}")
@@ -822,11 +1003,11 @@ def main() -> None:
         log(f"  Uploaded {_pk(MANIFEST_PREVIOUS_KEY)} (backup)")
 
     # ---- 7. Save last-dynamic-id for incremental runs ------------------------
-    if newest_id and dynamics_data and not _OUTPUT_PREFIX:
+    if newest_id and dynamics_data and pagination_complete:
         r2_put_last_id(newest_id)
         log(f"  Saved last-dynamic-id: {newest_id[:16]}...")
     else:
-        log("  Skipped last-dynamic-id save (no new items or no newest_id)")
+        log("  Skipped last-dynamic-id save (no newest item, no output, or incomplete pagination)")
 
     # ---- 8. Skip stale cleanup (keep all objects for now) --------------------
     log("[Step 8] Cleanup skipped — retaining all objects.")

@@ -11,6 +11,9 @@
   var thumbStrip = document.getElementById("lbThumbStrip");
   var tipEl = document.getElementById("lbTip");
   var zoomBadge = document.getElementById("lbZoomBadge");
+  var backgroundElements = document.querySelectorAll(
+    ".site-header, .search-bar, .filter-bar, .main-content, .site-footer"
+  );
 
   // --- State ---
   var images = [];
@@ -39,6 +42,7 @@
 
   // Tip timer
   var tipTimer = null;
+  var previousFocus = null;
 
   // --- Helpers ---
 
@@ -232,7 +236,8 @@
 
     var baseUrl = cfg();
     images.forEach(function (meta, i) {
-      var thumb = document.createElement("div");
+      var thumb = document.createElement("button");
+      thumb.type = "button";
       thumb.className = "lb-thumb";
       if (i === currentIdx) thumb.classList.add("active");
       thumb.title = (i + 1) + " / " + images.length;
@@ -270,18 +275,22 @@
 
   function show(imgs, idx) {
     if (!imgs || imgs.length === 0) return;
+    previousFocus = document.activeElement;
     images = imgs;
-    currentIdx = idx;
+    currentIdx = Math.max(0, Math.min(images.length - 1, Number(idx) || 0));
     zoom = 1; tx = 0; ty = 0;
+    overlay.hidden = false;
+    backgroundElements.forEach(function (element) { element.inert = true; });
     buildThumbnails();
     render();
     showTip();
-    overlay.hidden = false;
     document.body.style.overflow = "hidden";
+    closeBtn.focus();
   }
 
   function hide() {
     overlay.hidden = true;
+    backgroundElements.forEach(function (element) { element.inert = false; });
     document.body.style.overflow = "";
     images = [];
     currentIdx = 0;
@@ -290,6 +299,8 @@
     thumbStrip.innerHTML = "";
     content.classList.remove("mobile-reading");
     setZoomed(false);
+    if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
+    previousFocus = null;
   }
 
   function prev() {
@@ -442,7 +453,7 @@
       clampPan();
       applyTransform();
     }
-  }, { passive: true });
+  }, { passive: false });
 
   content.addEventListener("touchend", function (e) {
     if (e.touches.length === 0) {
@@ -463,6 +474,24 @@
   // --- Keyboard ---
   document.addEventListener("keydown", function (e) {
     if (overlay.hidden) return;
+    if (e.key === "Tab") {
+      var focusable = Array.prototype.filter.call(
+        overlay.querySelectorAll("button:not([disabled])"),
+        function (element) { return element.offsetParent !== null; }
+      );
+      if (focusable.length) {
+        var first = focusable[0];
+        var last = focusable[focusable.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+      return;
+    }
     switch (e.key) {
       case "Escape": hide(); break;
       case "ArrowLeft":  prev(); break;
