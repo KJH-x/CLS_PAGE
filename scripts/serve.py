@@ -13,13 +13,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.translate_path(self.path)
-        if not os.path.exists(path) and not self.path.startswith("/to/"):
+        spa = self.path.startswith("/to/") or self.path.startswith("/figures")
+        if not os.path.exists(path) and not spa:
             # Real 404 for non-SPA paths
             super().do_GET()
             return
-        # SPA fallback: serve index.html for any non-file path
+        # SPA fallback: serve the page shell for any non-file path
         if not os.path.isfile(path):
-            self.path = "/index.html"
+            self.path = "/figures/index.html" if self.path.startswith("/figures") else "/index.html"
         super().do_GET()
 
     def log_message(self, format, *args):

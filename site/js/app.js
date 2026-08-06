@@ -6,6 +6,10 @@
   var R2_BASE = window.ARCHIVE_CONFIG.R2_PUBLIC_URL;
   var PREVIEW_COUNT = 6;
 
+  var IS_FIGURES = document.body.dataset.page === "figures";
+  var INDEX_FILE = IS_FIGURES ? "/site/figures-index.json" : "/site/index.json";
+  var SEARCH_FILE = IS_FIGURES ? "/site/figures-search-index.json" : "/site/search-index.json";
+
   // DOM refs
   var timeline = document.getElementById("timeline");
   var loadingState = document.getElementById("loadingState");
@@ -36,6 +40,10 @@
     if (!appData || !appData.dynamics) return;
     var bar = document.getElementById("filterBar");
     bar.innerHTML = "";
+    if (IS_FIGURES) {
+      bar.hidden = true;
+      return;
+    }
     // Collect unique categories
     var cats = {};
     appData.dynamics.forEach(function (d) {
@@ -121,8 +129,9 @@
 
   function navigateToDynamic(dyn) {
     // Rewrite URL bar to clean base URL
-    var cleanUrl = window.location.origin + "/";
-    if (window.location.pathname !== "/" || window.location.hash) {
+    var cleanPath = IS_FIGURES ? "/figures/" : "/";
+    var cleanUrl = window.location.origin + cleanPath;
+    if (window.location.pathname !== cleanPath || window.location.hash) {
       history.replaceState(null, "", cleanUrl);
     }
 
@@ -184,8 +193,8 @@
   function fetchData() {
     showLoading();
 
-    var indexUrl = R2_BASE + "/site/index.json";
-    var searchUrl = R2_BASE + "/site/search-index.json";
+    var indexUrl = R2_BASE + INDEX_FILE;
+    var searchUrl = R2_BASE + SEARCH_FILE;
 
     Promise.all([
       fetch(indexUrl).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }),

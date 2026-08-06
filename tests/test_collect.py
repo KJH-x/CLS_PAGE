@@ -62,6 +62,127 @@ class CollectTests(unittest.TestCase):
         self.assertIsNotNone(dynamic)
         self.assertEqual(dynamic["date"], "2026-01-01")
 
+    def test_extract_dynamic_sales_info_archived_under_shangxin(self):
+        item = {
+            "id_str": "1221797962460430352",
+            "modules": {
+                "module_author": {"pub_ts": "1783310406"},
+                "module_dynamic": {
+                    "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                            "title": "",
+                            "summary": {
+                                "text": (
+                                    "#明日方舟##音律联觉##鹰角嘉年华##转发抽奖# \n"
+                                    "〓明日方舟| 音律联觉-昔时我见&2026鹰角嘉年华 主题周边〓现场&线上 贩售情报公开！\n"
+                                    "博士博士，兔兔送来全新的主题周边情报啦~"
+                                )
+                            },
+                            "pics": [
+                                {"url": "https://example.test/a.jpg", "width": 100, "height": 500}
+                            ],
+                        },
+                    }
+                },
+            },
+        }
+
+        dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "上新")
+        self.assertIn("贩售情报公开", dynamic["text"])
+
+    def test_extract_dynamic_sales_info_ignores_body_only_mention(self):
+        item = {
+            "id_str": "1220000000000000000",
+            "modules": {
+                "module_author": {"pub_ts": "1783310406"},
+                "module_dynamic": {
+                    "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                            "title": "",
+                            "summary": {
+                                "text": (
+                                    "〓朝陇山26 Jul.｜夏荫同栖〓实物展示\n"
+                                    "以下是完整的贩售情报公开，但不属于标题。"
+                                )
+                            },
+                            "pics": [
+                                {"url": "https://example.test/a.jpg", "width": 100, "height": 500}
+                            ],
+                        },
+                    }
+                },
+            },
+        }
+
+        self.assertIsNone(collect.extract_dynamic(item))
+
+    def test_extract_dynamic_figure_preorder_categorized_as_figure(self):
+        item = {
+            "id_str": "1199161743190786049",
+            "modules": {
+                "module_author": {"pub_ts": "1767225600"},
+                "module_dynamic": {
+                    "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                            "title": "",
+                            "summary": {
+                                "text": (
+                                    "#明日方舟# #APEX-TOYS# \n"
+                                    "〓明日方舟 1/7手办 Mon3tr 预售开启!〓 制作：APEX-TOYS\n"
+                                    "商品名称：明日方舟 1/7手办 Mon3tr 官方定价：899元"
+                                )
+                            },
+                            "pics": [
+                                {"url": "https://example.test/a.jpg", "width": 100, "height": 500}
+                            ],
+                        },
+                    }
+                },
+            },
+        }
+
+        dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "手办")
+        self.assertIn("Mon3tr", dynamic["text"])
+
+    def test_extract_dynamic_figure_preorder_title_only(self):
+        item = {
+            "id_str": "1220000000000000001",
+            "modules": {
+                "module_author": {"pub_ts": "1767225600"},
+                "module_dynamic": {
+                    "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                            "title": "",
+                            "summary": {
+                                "text": (
+                                    "〓朝陇山26 Jul.｜夏荫同栖〓上新\n"
+                                    "手办预售情报详见正文，但标题不匹配。"
+                                )
+                            },
+                            "pics": [
+                                {"url": "https://example.test/a.jpg", "width": 100, "height": 500}
+                            ],
+                        },
+                    }
+                },
+            },
+        }
+
+        dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "上新")
+
     def test_archive_date_accepts_historic_string_timestamp(self):
         self.assertEqual(collect.coerce_timestamp("1767225600"), 1767225600)
         self.assertEqual(collect.format_archive_date("1767225600"), "2026-01-01")

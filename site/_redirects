@@ -1,1 +1,3 @@
 /to/*  /index.html  200
+/figures  /figures/  200
+/figures/to/*  /figures/  200

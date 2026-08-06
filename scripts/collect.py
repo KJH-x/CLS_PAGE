@@ -81,6 +81,8 @@ MANIFEST_CURRENT_KEY = "manifests/current.json"
 MANIFEST_PREVIOUS_KEY = "manifests/previous.json"
 INDEX_KEY = "site/index.json"
 SEARCH_INDEX_KEY = "site/search-index.json"
+FIGURES_INDEX_KEY = "site/figures-index.json"
+FIGURES_SEARCH_INDEX_KEY = "site/figures-search-index.json"
 LAST_ID_KEY = "config/last-dynamic-id.json"
 
 def _pk(key: str) -> str:
@@ -415,6 +417,13 @@ _TAG_RE = re.compile(r"#(\S+?)#")
 # Only match dynamics with title pattern: 〓朝陇山{date}｜{name}〓上新
 _TITLE_PATTERN = re.compile(r"〓朝陇山\s*\d{1,2}\s*[A-Z][a-z]+\.?\s*[｜|].*〓(上新|余量上架|复刻上新)")
 
+# 贩售情报 announcements (e.g. 〓明日方舟×... 现场&线上 贩售情报公开！) are archived under 上新
+SALES_INFO_RE = re.compile(r".*贩售情报.*")
+
+# 手办预售 posts (e.g. 〓明日方舟 1/7手办 XXX 预售开启!〓) are archived in the /figures section
+FIGURE_PREORDER_RE = re.compile(r".*手办.*预售")
+FIGURE_PREORDER_CATEGORY = "手办"
+
 
 def extract_tags(text: str) -> list[str]:
     return _TAG_RE.findall(text)
@@ -422,6 +431,15 @@ def extract_tags(text: str) -> list[str]:
 
 def strip_tags(text: str) -> str:
     return _TAG_RE.sub("", text).strip()
+
+
+def first_text_line(text: str) -> str:
+    """First non-empty line after hashtag stripping — candidate title for matching."""
+    for line in text.split("\n"):
+        line = strip_tags(line).strip()
+        if line:
+            return line
+    return ""
 
 
 def coerce_timestamp(value: Any) -> int:
@@ -497,12 +515,18 @@ def extract_dynamic(item: dict) -> Optional[dict]:
     if not image_urls:
         return None
 
-    # Category detection: two patterns
-    #   1) 〓朝陇山{date}｜{name}〓{上新|余量上架}
-    #   2) Plain text with #余量上架# hashtag (no 〓 wrapper)
+    # Category detection:
+    #   1) 〓朝陇山{date}｜{name}〓{上新|余量上架|复刻上新}
+    #   2) 贩售情报 announcements (no 朝陇山{date} pattern) — archived under 上新
+    #   3) 手办预售 posts (title contains 手办...预售) — archived under /figures
+    #   4) Plain text with #余量上架# hashtag (no 〓 wrapper)
     title_match = _TITLE_PATTERN.search(search_text)
     if title_match:
         category = title_match.group(1)
+    elif SALES_INFO_RE.search(first_text_line(search_text)):
+        category = "上新"
+    elif FIGURE_PREORDER_RE.search(first_text_line(search_text)):
+        category = FIGURE_PREORDER_CATEGORY
     elif "余量上架" in search_text.replace("#", ""):
         category = "余量上架"
     else:
@@ -510,7 +534,7 @@ def extract_dynamic(item: dict) -> Optional[dict]:
 
     # Title: for 〓 pattern, extract the matching line; for 余量上架, use first line
     title = ""
-    if category == "上新" or (category == "余量上架" and _TITLE_PATTERN.search(search_text)):
+    if category == "上新" or category == FIGURE_PREORDER_CATEGORY or (category == "余量上架" and _TITLE_PATTERN.search(search_text)):
         # Has 〓 pattern — find that line
         for line in search_text.split("\n"):
             line = line.strip()
@@ -691,6 +715,20 @@ def main() -> None:
     else:
         log("  No previous index.json (first run).")
 
+    old_figures_index = r2_get_json(_pk(FIGURES_INDEX_KEY))
+    if old_figures_index:
+        figure_count = 0
+        for od in old_figures_index.get("dynamics", []):
+            od["timestamp"] = coerce_timestamp(od.get("timestamp"))
+            normalized_date = format_archive_date(od["timestamp"])
+            if normalized_date:
+                od["date"] = normalized_date
+            old_dynamics_map[od.get("id", "")] = od
+            figure_count += 1
+            for oi in od.get("images", []):
+                old_images_map[oi.get("r2Key", "")] = oi
+        log(f"  Loaded figures index with {figure_count} dynamics for metadata recovery.")
+
     # ---- 2. Fetch dynamics ---------------------------------------------------
     log("[Step 2] Fetching Bilibili dynamics...")
     raw_items, newest_id, pagination_complete = fetch_dynamics(last_id)
@@ -753,9 +791,12 @@ def main() -> None:
             seen_activities.add(key)
             merged_deduped.append(dynamic)
     deduped = sorted(merged_deduped, key=lambda d: d["timestamp"], reverse=True)
-    selected = deduped[:_KEEP_RECENT]
+    figure_category = FIGURE_PREORDER_CATEGORY
+    main_selected = [d for d in deduped if d.get("category") != figure_category][:_KEEP_RECENT]
+    figure_selected = [d for d in deduped if d.get("category") == figure_category]
+    selected = main_selected + figure_selected
     log(f"  Newly extracted: {len(candidates)}, merged from old index: {merged_from_old}")
-    log(f"  Selected (top {_KEEP_RECENT}): {len(selected)}")
+    log(f"  Selected (top {_KEEP_RECENT} main + all figures): {len(main_selected)} main, {len(figure_selected)} figures")
 
     if not selected:
         log("WARNING: No image-containing dynamics found. Aborting to preserve existing index.")
@@ -767,6 +808,8 @@ def main() -> None:
     tracked_objects: set[str] = {
         _pk(INDEX_KEY),
         _pk(SEARCH_INDEX_KEY),
+        _pk(FIGURES_INDEX_KEY),
+        _pk(FIGURES_SEARCH_INDEX_KEY),
         _pk(MANIFEST_CURRENT_KEY),
         _pk(MANIFEST_PREVIOUS_KEY),
         _pk(LAST_ID_KEY),
@@ -959,30 +1002,55 @@ def main() -> None:
     # ---- 5. Build & upload index files ---------------------------------------
     log(f"[Step 5] Building & uploading index files...  (prefix: '{_OUTPUT_PREFIX or '(production)'}')")
 
+    figure_category = FIGURE_PREORDER_CATEGORY
+    main_dynamics = [d for d in dynamics_data if d.get("category") != figure_category]
+    figure_dynamics = [d for d in dynamics_data if d.get("category") == figure_category]
+    main_imgs = sum(d["imageCount"] for d in main_dynamics)
+    figure_imgs = sum(d["imageCount"] for d in figure_dynamics)
+
     index_data: dict = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "keepRecent": _KEEP_RECENT,
-        "totalDynamics": len(dynamics_data),
-        "totalImages": total_imgs,
-        "dynamics": dynamics_data,
+        "totalDynamics": len(main_dynamics),
+        "totalImages": main_imgs,
+        "dynamics": main_dynamics,
     }
 
-    search_index: list[dict] = []
-    for d in dynamics_data:
-        search_index.append({
-            "dynamicId": d["id"],
-            "text": d["text"],
-            "date": d["date"],
-            "tags": d["tags"],
-            "category": d.get("category", ""),
-            "imageCount": d["imageCount"],
-        })
+    figures_index_data: dict = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "keepRecent": _KEEP_RECENT,
+        "totalDynamics": len(figure_dynamics),
+        "totalImages": figure_imgs,
+        "dynamics": figure_dynamics,
+    }
+
+    def build_search_index(dynamics: list[dict]) -> list[dict]:
+        return [
+            {
+                "dynamicId": d["id"],
+                "text": d["text"],
+                "date": d["date"],
+                "tags": d["tags"],
+                "category": d.get("category", ""),
+                "imageCount": d["imageCount"],
+            }
+            for d in dynamics
+        ]
+
+    search_index = build_search_index(main_dynamics)
+    figures_search_index = build_search_index(figure_dynamics)
 
     r2_put_json(_pk(INDEX_KEY), index_data)
-    log(f"  Uploaded {_pk(INDEX_KEY)}  ({len(dynamics_data)} dynamics, {index_data['totalImages']} images)")
+    log(f"  Uploaded {_pk(INDEX_KEY)}  ({len(main_dynamics)} dynamics, {main_imgs} images)")
 
     r2_put_json(_pk(SEARCH_INDEX_KEY), search_index)
     log(f"  Uploaded {_pk(SEARCH_INDEX_KEY)}  ({len(search_index)} entries)")
+
+    r2_put_json(_pk(FIGURES_INDEX_KEY), figures_index_data)
+    log(f"  Uploaded {_pk(FIGURES_INDEX_KEY)}  ({len(figure_dynamics)} dynamics, {figure_imgs} images)")
+
+    r2_put_json(_pk(FIGURES_SEARCH_INDEX_KEY), figures_search_index)
+    log(f"  Uploaded {_pk(FIGURES_SEARCH_INDEX_KEY)}  ({len(figures_search_index)} entries)")
 
     # ---- 6. Build & upload manifest ------------------------------------------
     log("[Step 6] Building & uploading manifests...")
@@ -990,7 +1058,7 @@ def main() -> None:
     new_manifest: dict = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "keepRecent": _KEEP_RECENT,
-        "totalImages": index_data["totalImages"],
+        "totalImages": main_imgs + figure_imgs,
         "dynamics": [d["id"] for d in dynamics_data],
         "objects": sorted(tracked_objects),
     }
@@ -1003,11 +1071,15 @@ def main() -> None:
         log(f"  Uploaded {_pk(MANIFEST_PREVIOUS_KEY)} (backup)")
 
     # ---- 7. Save last-dynamic-id for incremental runs ------------------------
-    if newest_id and dynamics_data and pagination_complete:
-        r2_put_last_id(newest_id)
-        log(f"  Saved last-dynamic-id: {newest_id[:16]}...")
+    # The newest archived dynamic is treated as the max node; future runs scan only
+    # forward from here and never re-scan the full history.
+    if dynamics_data:
+        newest_dyn = max(dynamics_data, key=lambda d: d["timestamp"])
+        r2_put_last_id(newest_dyn["id"])
+        note = "" if pagination_complete else " (pagination reached the page cap; not scanning further back)"
+        log(f"  Saved last-dynamic-id: {newest_dyn['id'][:16]}... (max node){note}")
     else:
-        log("  Skipped last-dynamic-id save (no newest item, no output, or incomplete pagination)")
+        log("  Skipped last-dynamic-id save (no output dynamics)")
 
     # ---- 8. Skip stale cleanup (keep all objects for now) --------------------
     log("[Step 8] Cleanup skipped — retaining all objects.")
@@ -1015,8 +1087,8 @@ def main() -> None:
     # ---- 9. Final summary ----------------------------------------------------
     log("=" * 60)
     log("COLLECTION COMPLETE")
-    log(f"  Dynamics archived  : {len(dynamics_data)}")
-    log(f"  Total images       : {index_data['totalImages']}")
+    log(f"  Dynamics archived  : {len(main_dynamics)} main + {len(figure_dynamics)} figures")
+    log(f"  Total images       : {main_imgs + figure_imgs}")
     log(f"  Newly uploaded     : {stats_new}")
     log(f"  Recovered (existing): {stats_recovered}")
     log(f"  Failed             : {stats_fail}")
