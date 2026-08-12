@@ -7,20 +7,25 @@ import os
 PORT = 17099
 DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "site")
 
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=DIR, **kwargs)
 
     def do_GET(self):
         path = self.translate_path(self.path)
-        spa = self.path.startswith("/to/") or self.path.startswith("/figures")
+        spa = (
+            self.path.startswith("/to/")
+            or self.path.startswith("/ak")
+            or self.path.startswith("/ef")
+        )
         if not os.path.exists(path) and not spa:
             # Real 404 for non-SPA paths
             super().do_GET()
             return
         # SPA fallback: serve the page shell for any non-file path
         if not os.path.isfile(path):
-            self.path = "/figures/index.html" if self.path.startswith("/figures") else "/index.html"
+            self.path = "/index.html"
         super().do_GET()
 
     def log_message(self, format, *args):
@@ -29,6 +34,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 class ReusableTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
+
 
 if __name__ == "__main__":
     print(f"Serving {DIR}")

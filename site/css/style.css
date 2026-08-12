@@ -143,6 +143,29 @@ input { font-family: inherit; }
   gap: 8px;
 }
 
+.account-nav,
+.page-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nav-btn {
+  padding: 6px 14px;
+  border-radius: 16px;
+  font-size: 0.82rem;
+  background: var(--c-btn-bg);
+  color: var(--c-text-dim);
+  white-space: nowrap;
+  transition: background 0.2s, color 0.2s;
+}
+.nav-btn:hover { background: var(--c-btn-hover); color: var(--c-text); }
+.nav-btn.active {
+  background: var(--c-btn-hover);
+  color: var(--c-text);
+  font-weight: 600;
+}
+
 .theme-toggle {
   width: 36px; height: 36px;
   border-radius: 50%;
@@ -167,6 +190,16 @@ input { font-family: inherit; }
   transition: background 0.2s, color 0.2s;
 }
 .page-switch:hover { background: var(--c-btn-hover); color: var(--c-text); text-decoration: none; }
+
+/* ------------------------------------------------------------------
+   Route fade transition (SPA)
+   ------------------------------------------------------------------ */
+#timeline {
+  transition: opacity 0.2s ease;
+}
+#timeline.fade-out {
+  opacity: 0;
+}
 
 /* ------------------------------------------------------------------
    Search Bar — sticky

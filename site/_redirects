@@ -1,3 +1,9 @@
+/ak  /index.html  200
+/ak/  /index.html  200
+/ak-figures  /index.html  200
+/ak-figures/  /index.html  200
+/ef  /index.html  200
+/ef/  /index.html  200
+/ef-figures  /index.html  200
+/ef-figures/  /index.html  200
 /to/*  /index.html  200
-/figures  /figures/  200
-/figures/to/*  /figures/  200

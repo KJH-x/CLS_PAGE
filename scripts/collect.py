@@ -57,6 +57,7 @@ _R2_BUCKET = os.environ.get("R2_BUCKET", "")
 _R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 _BILI_COOKIE = os.environ.get("BILIBILI_COOKIE", "")
 _BILI_UID = os.environ.get("BILIBILI_UID", "")
+_ARCHIVE_MODE = os.environ.get("ARCHIVE_MODE", "cls").strip().lower()
 _KEEP_RECENT = _env_int("KEEP_RECENT", "10")
 _OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "")
 _DRY_RUN = os.environ.get("DRY_RUN", "") != ""
@@ -105,6 +106,8 @@ def validate_environment() -> None:
         raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
     if not _BILI_UID.isdigit():
         raise SystemExit("BILIBILI_UID must contain digits only")
+    if _ARCHIVE_MODE not in ("cls", "endfield"):
+        raise SystemExit("ARCHIVE_MODE must be 'cls' or 'endfield'")
     if _KEEP_RECENT <= 0:
         raise SystemExit("KEEP_RECENT must be greater than zero")
     if _MAX_IMAGE_FAILURES < 0:
@@ -515,49 +518,18 @@ def extract_dynamic(item: dict) -> Optional[dict]:
     if not image_urls:
         return None
 
-    # Category detection:
-    #   1) 〓朝陇山{date}｜{name}〓{上新|余量上架|复刻上新}
-    #   2) 贩售情报 announcements (no 朝陇山{date} pattern) — archived under 上新
-    #   3) 手办预售 posts (title contains 手办...预售) — archived under /figures
-    #   4) Plain text with #余量上架# hashtag (no 〓 wrapper)
-    title_match = _TITLE_PATTERN.search(search_text)
-    if title_match:
-        category = title_match.group(1)
-    elif SALES_INFO_RE.search(first_text_line(search_text)):
-        category = "上新"
-    elif FIGURE_PREORDER_RE.search(first_text_line(search_text)):
-        category = FIGURE_PREORDER_CATEGORY
-    elif "余量上架" in search_text.replace("#", ""):
-        category = "余量上架"
+    # Category detection — per-archive mode:
+    #   cls     : 〓朝陇山{date}｜{name}〓{上新|余量上架|复刻上新} / 贩售情报 / 手办预售 / 余量上架
+    #   endfield: action-word rules on the ▼...▼ title (上新/预售/余量上架/手办); no series split
+    if _ARCHIVE_MODE == "endfield":
+        category, title = _endfield_categorize(search_text)
+        if category is None:
+            return None
     else:
-        return None
-
-    # Title: for 〓 pattern, extract the matching line; for 余量上架, use first line
-    title = ""
-    if category == "上新" or category == FIGURE_PREORDER_CATEGORY or (category == "余量上架" and _TITLE_PATTERN.search(search_text)):
-        # Has 〓 pattern — find that line
-        for line in search_text.split("\n"):
-            line = line.strip()
-            if _TITLE_PATTERN.search(line):
-                title = strip_tags(line).strip()
-                break
-        if not title:
-            for line in search_text.split("\n"):
-                line = line.strip()
-                if "〓" in line:
-                    title = strip_tags(line).strip()
-                    break
-    if not title:
-        # Fallback: first non-empty, non-hashtag-only line
-        for line in search_text.split("\n"):
-            line = line.strip()
-            cleaned = strip_tags(line)
-            if cleaned:
-                title = cleaned
-                break
-    title = re.sub(r"^互动抽奖\s*", "", title).strip()
-    if not title:
-        title = "(no title)"
+        category = _cls_categorize(search_text)
+        if category is None:
+            return None
+        title = _cls_title(search_text, category)
 
     tags = extract_tags(search_text)
 
@@ -572,6 +544,90 @@ def extract_dynamic(item: dict) -> Optional[dict]:
         "category": category,
         "imageUrls": image_urls,
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-mode categorization
+# ---------------------------------------------------------------------------
+
+# endfield figure pre-order detection (title-line only)
+_ENDFIELD_FIGURE_RE = re.compile(r"手办.*?(预售|企划公开|开订|再贩)")
+# endfield "上新" action words
+_ENDFIELD_UP_RE = re.compile(r"上新|周边介绍|贩售情报|场贩")
+# endfield 余量/掉落
+_ENDFIELD_SURPLUS_RE = re.compile(r"余量|掉落")
+
+
+def _fence_line(text: str) -> str:
+    """First line containing a 〓 or ▼ fence — the original title (unchanged)."""
+    for line in text.split("\n"):
+        line = line.strip()
+        if line and ("〓" in line or "▼" in line):
+            return line
+    for line in text.split("\n"):
+        line = line.strip()
+        if line:
+            return line
+    return "(no title)"
+
+
+def _endfield_categorize(search_text: str) -> tuple[Optional[str], str]:
+    """Categorize an Endfield dynamic by action words on its original title.
+
+    Returns (category, title) or (None, title) when the post should be excluded.
+    Keeps the original title verbatim (no forced conversion)."""
+    title = _fence_line(search_text)
+    if _ENDFIELD_FIGURE_RE.search(title):
+        return FIGURE_PREORDER_CATEGORY, title
+    if "预售" in title:
+        return "预售", title
+    if _ENDFIELD_UP_RE.search(title):
+        return "上新", title
+    if _ENDFIELD_SURPLUS_RE.search(title):
+        return "余量上架", title
+    return None, title
+
+
+def _cls_categorize(search_text: str) -> Optional[str]:
+    """cls categorization: returns category or None."""
+    title_match = _TITLE_PATTERN.search(search_text)
+    if title_match:
+        return title_match.group(1)
+    if SALES_INFO_RE.search(first_text_line(search_text)):
+        return "上新"
+    if FIGURE_PREORDER_RE.search(first_text_line(search_text)):
+        return FIGURE_PREORDER_CATEGORY
+    if "余量上架" in search_text.replace("#", ""):
+        return "余量上架"
+    return None
+
+
+def _cls_title(search_text: str, category: str) -> str:
+    """cls title extraction (unchanged behaviour)."""
+    title = ""
+    if category == "上新" or category == FIGURE_PREORDER_CATEGORY or (category == "余量上架" and _TITLE_PATTERN.search(search_text)):
+        for line in search_text.split("\n"):
+            line = line.strip()
+            if _TITLE_PATTERN.search(line):
+                title = strip_tags(line).strip()
+                break
+        if not title:
+            for line in search_text.split("\n"):
+                line = line.strip()
+                if "〓" in line:
+                    title = strip_tags(line).strip()
+                    break
+    if not title:
+        for line in search_text.split("\n"):
+            line = line.strip()
+            cleaned = strip_tags(line)
+            if cleaned:
+                title = cleaned
+                break
+    title = re.sub(r"^互动抽奖\s*", "", title).strip()
+    if not title:
+        title = "(no title)"
+    return title
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +729,7 @@ def main() -> None:
     log("=" * 60)
     log("Bilibili Dynamic Archiver — Cloudflare R2 edition")
     log(f"  UID        : {_BILI_UID}")
+    log(f"  Mode       : {_ARCHIVE_MODE}")
     log(f"  KEEP_RECENT: {_KEEP_RECENT}")
     log(f"  R2 bucket  : {_R2_BUCKET}")
     log(f"  Prefix     : {_OUTPUT_PREFIX or '(production)'}")

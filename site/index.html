@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="light dark">
-<title>朝陇山图片归档</title>
+<title>明日方舟周边图片归档</title>
 <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
@@ -12,11 +12,12 @@
 <header class="site-header">
   <div class="header-inner">
     <div class="header-left">
-      <h1 class="site-title">朝陇山图片归档</h1>
+      <h1 class="site-title" id="siteTitle">明日方舟周边图片归档</h1>
       <p class="site-subtitle">最近更新的 <span id="headerCount">—</span> 条动态 · <span id="headerTime">—</span></p>
     </div>
     <div class="header-controls">
-      <a class="page-switch" href="/figures/" title="手办预售归档" aria-label="查看手办预售归档">手办</a>
+      <nav class="account-nav" id="accountNav" aria-label="账号切换"></nav>
+      <nav class="page-nav" id="pageNav" aria-label="页面切换"></nav>
       <button class="theme-toggle" id="themeToggle" title="切换主题" aria-label="切换深浅色主题">
         <span class="icon-sun">☀</span>
         <span class="icon-moon">☾</span>
@@ -30,7 +31,7 @@
     type="search"
     id="searchInput"
     class="search-input"
-    placeholder="搜索标题、标签或日期，例如 7周年"
+    placeholder="搜索标题、标签或日期，例如 预售"
     autocomplete="off"
     aria-label="搜索动态"
   />

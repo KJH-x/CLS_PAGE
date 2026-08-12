@@ -188,6 +188,97 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(collect.format_archive_date("1767225600"), "2026-01-01")
         self.assertEqual(collect.format_archive_date("invalid"), "")
 
+    # ------------------------------------------------------------------
+    # Endfield (山团团) mode
+    # ------------------------------------------------------------------
+
+    def _endfield_item(self, summary_text, pics=None):
+        return {
+            "id_str": "1230000000000000000",
+            "modules": {
+                "module_author": {"pub_ts": "1767225600"},
+                "module_dynamic": {
+                    "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                            "title": "",
+                            "summary": {"text": summary_text},
+                            "pics": pics
+                            or [{"url": "https://example.test/a.jpg", "width": 100, "height": 500}],
+                        },
+                    }
+                },
+            },
+        }
+
+    def test_endfield_new_arrival_categorized_shangxin_keeps_original_title(self):
+        item = self._endfield_item(
+            "▼相伴庆典开幕！▼山团团上新： #渊客停# 周边介绍\n哇！转眼间，团团迎来了第一个庆典"
+        )
+        with mock.patch.object(collect, "_ARCHIVE_MODE", "endfield"):
+            dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "上新")
+        self.assertEqual(dynamic["text"], "▼相伴庆典开幕！▼山团团上新： #渊客停# 周边介绍")
+
+    def test_endfield_preorder_non_figure_categorized_yushou(self):
+        item = self._endfield_item(
+            "▼明日方舟：终末地纪念插画集Vol.1 预售开启▼\n详情见正文"
+        )
+        with mock.patch.object(collect, "_ARCHIVE_MODE", "endfield"):
+            dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "预售")
+        self.assertIn("预售开启", dynamic["text"])
+
+    def test_endfield_figure_preorder_categorized_figure(self):
+        item = self._endfield_item(
+            "▼明日方舟：终末地 1/7手办 陈千语 预售开启▼\n商品信息"
+        )
+        with mock.patch.object(collect, "_ARCHIVE_MODE", "endfield"):
+            dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "手办")
+
+    def test_endfield_surplus_categorized_yuliangshangjia(self):
+        item = self._endfield_item(
+            "#启程补给#系列商品，余量掉落！ 欢迎管理员前来看看呀~"
+        )
+        with mock.patch.object(collect, "_ARCHIVE_MODE", "endfield"):
+            dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "余量上架")
+
+    def test_endfield_merchandise_display_is_excluded(self):
+        # 实物展示图片 post — no action word → excluded
+        item = self._endfield_item(
+            "▼山团团#渊客停#▼山团团毛绒玩偶&挂件-梨诺VER. 实物展示图片\n₊ ⊹ 闪亮登场"
+        )
+        with mock.patch.object(collect, "_ARCHIVE_MODE", "endfield"):
+            self.assertIsNone(collect.extract_dynamic(item))
+
+    def test_endfield_daily_post_is_excluded(self):
+        item = self._endfield_item(
+            "▼打灰？ING！▼ EP14 现在！立刻！我要知道这期纪念品的全部信息！\n友情提示：纯属娱乐"
+        )
+        with mock.patch.object(collect, "_ARCHIVE_MODE", "endfield"):
+            self.assertIsNone(collect.extract_dynamic(item))
+
+    def test_endfield_figure_presale_not_series_split(self):
+        # "手办" + "企划公开" in title → figures, even without 预售 word
+        item = self._endfield_item(
+            "▼明日方舟：终末地 1/7手办 莱万汀 企划公开▼\n实体化企划进行中"
+        )
+        with mock.patch.object(collect, "_ARCHIVE_MODE", "endfield"):
+            dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "手办")
+
     def test_archived_image_inputs_preserve_sparse_r2_keys(self):
         old_images = [
             {

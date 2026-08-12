@@ -1,16 +1,27 @@
-// app.js — Main application: fetch data, render gallery-first timeline
+// app.js — Main application: SPA routing, fetch data, render gallery-first timeline
+//
+// Routes (account × page), fully isolated:
+//   /ak/         朝陇山 main
+//   /ak-figures/ 朝陇山 手办
+//   /ef/         山团团 main
+//   /ef-figures/ 山团团 手办
+//
+// Navigation is pushState-based (no reload). Content cross-fades; only images load.
+// Remembers the last opened route (archive.lastRoute) and per-route scroll offsets
+// (archive.scroll.<route>). "/" redirects to the last route (default /ak/).
 
 (function () {
   "use strict";
 
-  var R2_BASE = window.ARCHIVE_CONFIG.R2_PUBLIC_URL;
+  var CFG = window.ARCHIVE_CONFIG;
+  var R2_BASE = CFG.R2_PUBLIC_URL;
   var PREVIEW_COUNT = 6;
+  var FADE_MS = 200;
 
-  var IS_FIGURES = document.body.dataset.page === "figures";
-  var INDEX_FILE = IS_FIGURES ? "/site/figures-index.json" : "/site/index.json";
-  var SEARCH_FILE = IS_FIGURES ? "/site/figures-search-index.json" : "/site/search-index.json";
+  var LS_LAST = "archive.lastRoute";
+  var LS_SCROLL = "archive.scroll.";
 
-  // DOM refs
+  // ---- DOM refs ----
   var timeline = document.getElementById("timeline");
   var loadingState = document.getElementById("loadingState");
   var errorState = document.getElementById("errorState");
@@ -20,13 +31,156 @@
   var noResults = document.getElementById("noResults");
   var footerTime = document.getElementById("footerTime");
   var footerCount = document.getElementById("footerCount");
+  var headerCount = document.getElementById("headerCount");
+  var headerTime = document.getElementById("headerTime");
+  var siteTitle = document.getElementById("siteTitle");
+  var accountNav = document.getElementById("accountNav");
+  var pageNav = document.getElementById("pageNav");
 
-  // State
+  // ---- State ----
   var appData = null;
   var searchData = null;
   var currentCategory = "";
   var activeSearchIds = null;
+  var currentRoute = null;      // {account, page}
   var routeTarget = null;
+  var searchInput = document.getElementById("searchInput");
+
+  var ROUTE_PATHS = {
+    "ak": { main: "/ak/", figures: "/ak-figures/" },
+    "ef": { main: "/ef/", figures: "/ef-figures/" },
+  };
+
+  // ------------------------------------------------------------------
+  // Routing
+  // ------------------------------------------------------------------
+
+  function parseRoute(pathname) {
+    if (pathname.indexOf("/ak-figures") === 0) return { account: "ak", page: "figures" };
+    if (pathname.indexOf("/ak") === 0) return { account: "ak", page: "main" };
+    if (pathname.indexOf("/ef-figures") === 0) return { account: "ef", page: "figures" };
+    if (pathname.indexOf("/ef") === 0) return { account: "ef", page: "main" };
+    return null;
+  }
+
+  function routePath(route) {
+    return ROUTE_PATHS[route.account][route.page];
+  }
+
+  function accountLabel(account) {
+    return CFG.ACCOUNTS[account] ? CFG.ACCOUNTS[account].label : account;
+  }
+
+  function indexFile(route) {
+    var acc = CFG.ACCOUNTS[route.account];
+    return route.page === "figures" ? acc.figures : acc.index;
+  }
+
+  function searchFile(route) {
+    var acc = CFG.ACCOUNTS[route.account];
+    return route.page === "figures" ? acc.figuresSearch : acc.search;
+  }
+
+  // ------------------------------------------------------------------
+  // Navigation
+  // ------------------------------------------------------------------
+
+  function rememberRoute(route) {
+    try { localStorage.setItem(LS_LAST, routePath(route)); } catch (e) { /* ignore */ }
+  }
+
+  function rememberScroll() {
+    if (!currentRoute) return;
+    try { localStorage.setItem(LS_SCROLL + routePath(currentRoute), String(window.scrollY || 0)); } catch (e) { /* ignore */ }
+  }
+
+  function restoreScroll() {
+    if (!currentRoute) return;
+    var saved = null;
+    try { saved = parseInt(localStorage.getItem(LS_SCROLL + routePath(currentRoute)) || "0", 10); } catch (e) { /* ignore */ }
+    if (saved && saved > 0) {
+      // wait for images to start laying out so the position is meaningful
+      setTimeout(function () { window.scrollTo(0, saved); }, 50);
+    } else {
+      window.scrollTo(0, 0);
+    }
+  }
+
+  function renderNav() {
+    accountNav.innerHTML = "";
+    pageNav.innerHTML = "";
+    Object.keys(CFG.ACCOUNTS).forEach(function (acc) {
+      var b = document.createElement("button");
+      b.className = "nav-btn" + (acc === currentRoute.account ? " active" : "");
+      b.textContent = CFG.ACCOUNTS[acc].label;
+      b.addEventListener("click", function () {
+        navigateTo({ account: acc, page: currentRoute.page });
+      });
+      accountNav.appendChild(b);
+    });
+    ["main", "figures"].forEach(function (page) {
+      var b = document.createElement("button");
+      b.className = "nav-btn" + (page === currentRoute.page ? " active" : "");
+      b.textContent = page === "figures" ? "手办" : "全部";
+      b.addEventListener("click", function () {
+        navigateTo({ account: currentRoute.account, page: page });
+      });
+      pageNav.appendChild(b);
+    });
+  }
+
+  function updateShell() {
+    var acc = CFG.ACCOUNTS[currentRoute.account];
+    var title = acc.label + (currentRoute.page === "figures" ? "手办预售归档" : "图片归档");
+    siteTitle.textContent = title;
+    document.title = title + " - 明日方舟周边图片归档";
+    renderNav();
+  }
+
+  function navigateTo(route, opts) {
+    opts = opts || {};
+    if (currentRoute &&
+        currentRoute.account === route.account &&
+        currentRoute.page === route.page &&
+        !opts.force) {
+      return;
+    }
+    rememberScroll();
+    rememberRoute(route);
+    currentRoute = route;
+    var path = routePath(route);
+    if (window.location.pathname !== path) {
+      history.pushState({ route: path }, "", path);
+    }
+    updateShell();
+    loadRoute(route);
+  }
+
+  window.addEventListener("popstate", function () {
+    var route = parseRoute(window.location.pathname);
+    if (!route) { redirectToLast(); return; }
+    currentRoute = route;
+    rememberRoute(route);
+    updateShell();
+    loadRoute(route);
+  });
+
+  function redirectToLast() {
+    var last = null;
+    try { last = localStorage.getItem(LS_LAST); } catch (e) { /* ignore */ }
+    var route = last ? parseRoute(last) : null;
+    if (!route) route = { account: "ak", page: "main" };
+    currentRoute = route;
+    var path = routePath(route);
+    try { localStorage.setItem(LS_LAST, path); } catch (e) { /* ignore */ }
+    history.replaceState({ route: path }, "", path);
+    updateShell();
+    loadRoute(route);
+  }
+
+  // ------------------------------------------------------------------
+  // Data load with fade
+  // ------------------------------------------------------------------
 
   function setCategory(cat) {
     currentCategory = cat;
@@ -40,24 +194,22 @@
     if (!appData || !appData.dynamics) return;
     var bar = document.getElementById("filterBar");
     bar.innerHTML = "";
-    if (IS_FIGURES) {
+    if (currentRoute.page === "figures") {
       bar.hidden = true;
       return;
     }
-    // Collect unique categories
+    bar.hidden = false;
     var cats = {};
     appData.dynamics.forEach(function (d) {
       var c = d.category || "";
       if (c) cats[c] = (cats[c] || 0) + 1;
     });
-    // "全部" first
     var btn = document.createElement("button");
     btn.className = "filter-btn active";
     btn.dataset.cat = "";
     btn.textContent = "全部";
     btn.addEventListener("click", function () { setCategory(""); });
     bar.appendChild(btn);
-    // One per category
     Object.keys(cats).sort().forEach(function (cat) {
       var b = document.createElement("button");
       b.className = "filter-btn";
@@ -66,6 +218,57 @@
       b.addEventListener("click", function () { setCategory(cat); });
       bar.appendChild(b);
     });
+  }
+
+  function loadRoute(route) {
+    showLoading();
+    currentCategory = "";
+    activeSearchIds = null;
+    if (searchInput) {
+      searchInput.value = "";
+      var clearBtn = document.getElementById("searchClear");
+      if (clearBtn) clearBtn.hidden = true;
+      var statusEl = document.getElementById("searchStatus");
+      if (statusEl) statusEl.textContent = "";
+    }
+
+    timeline.classList.add("fade-out");
+
+    var indexUrl = R2_BASE + indexFile(route);
+    var searchUrl = R2_BASE + searchFile(route);
+
+    Promise.all([
+      fetch(indexUrl).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }),
+      fetch(searchUrl).then(function (r) { return r.ok ? r.json() : Promise.resolve(null); }).catch(function () { return null; })
+    ])
+    .then(function (results) {
+      appData = results[0];
+      searchData = results[1];
+      if (!appData || !appData.dynamics) throw new Error("Invalid index format");
+      appData.dynamics = appData.dynamics.map(normalizeDynamic);
+      hideLoading();
+      setupSearch();
+      initFilterBar();
+      checkRoute();
+      render();
+      if (routeTarget) {
+        navigateToDynamic(routeTarget);
+      }
+      setTimeout(fadeIn, FADE_MS);
+      restoreScroll();
+      if (routeTarget) {
+        setTimeout(function () { navigateToDynamic(routeTarget); }, FADE_MS + 60);
+      }
+    })
+    .catch(function (err) {
+      console.error("Fetch error:", err);
+      showError("无法加载归档数据：" + err.message);
+      timeline.classList.remove("fade-out");
+    });
+  }
+
+  function fadeIn() {
+    timeline.classList.remove("fade-out");
   }
 
   // ------------------------------------------------------------------
@@ -119,7 +322,6 @@
     }
 
     if (routeTarget) {
-      // Show all categories so the target isn't hidden
       currentCategory = "";
       document.querySelectorAll(".filter-btn").forEach(function (btn) {
         btn.classList.toggle("active", btn.dataset.cat === "");
@@ -128,8 +330,7 @@
   }
 
   function navigateToDynamic(dyn) {
-    // Rewrite URL bar to clean base URL
-    var cleanPath = IS_FIGURES ? "/figures/" : "/";
+    var cleanPath = routePath(currentRoute);
     var cleanUrl = window.location.origin + cleanPath;
     if (window.location.pathname !== cleanPath || window.location.hash) {
       history.replaceState(null, "", cleanUrl);
@@ -190,37 +391,7 @@
     return dyn;
   }
 
-  function fetchData() {
-    showLoading();
-
-    var indexUrl = R2_BASE + INDEX_FILE;
-    var searchUrl = R2_BASE + SEARCH_FILE;
-
-    Promise.all([
-      fetch(indexUrl).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }),
-      fetch(searchUrl).then(function (r) { return r.ok ? r.json() : Promise.resolve(null); }).catch(function () { return null; })
-    ])
-    .then(function (results) {
-      appData = results[0];
-      searchData = results[1];
-      if (!appData || !appData.dynamics) throw new Error("Invalid index format");
-      appData.dynamics = appData.dynamics.map(normalizeDynamic);
-      hideLoading();
-      setupSearch();
-      initFilterBar();
-      checkRoute();
-      render();
-      if (routeTarget) {
-        navigateToDynamic(routeTarget);
-      }
-    })
-    .catch(function (err) {
-      console.error("Fetch error:", err);
-      showError("无法加载归档数据：" + err.message);
-    });
-  }
-
-  errorRetry.addEventListener("click", fetchData);
+  errorRetry.addEventListener("click", function () { loadRoute(currentRoute); });
 
   // ------------------------------------------------------------------
   // Render
@@ -265,10 +436,8 @@
       var countStr = String(appData.totalDynamics || appData.dynamics.length || 0);
       footerTime.textContent = timeStr;
       footerCount.textContent = countStr;
-      var hc = document.getElementById("headerCount");
-      var ht = document.getElementById("headerTime");
-      if (hc) hc.textContent = countStr;
-      if (ht) ht.textContent = timeStr;
+      if (headerCount) headerCount.textContent = countStr;
+      if (headerTime) headerTime.textContent = timeStr;
     }
   }
 
@@ -281,7 +450,6 @@
     card.className = "dynamic-card";
     card.dataset.id = dyn.id;
 
-    // ---- Header ----
     var header = document.createElement("div");
     header.className = "card-header";
 
@@ -297,11 +465,9 @@
     header.appendChild(dateEl);
     header.appendChild(titleEl);
 
-    // Meta row
     var metaRow = document.createElement("div");
     metaRow.className = "card-meta";
 
-    // Tags: show max 3
     if (dyn.tags && dyn.tags.length > 0) {
       var shown = dyn.tags.slice(0, 3);
       shown.forEach(function (t) {
@@ -333,7 +499,6 @@
 
     header.appendChild(metaRow);
 
-    // ---- Preview grid (always shown, first 6 images) ----
     var imageContainer = document.createElement("div");
     imageContainer.className = "card-images";
     var imagesId = "images-" + dyn.id;
@@ -349,7 +514,6 @@
       }
       imageContainer.appendChild(previewGrid);
 
-      // Remaining images (hidden behind view-all)
       if (dyn.images.length > PREVIEW_COUNT) {
         var restGrid = document.createElement("div");
         restGrid.className = "image-grid";
@@ -361,7 +525,6 @@
       }
     }
 
-    // ---- View all button ----
     var viewAllBtn = null;
     if (dyn.imageCount > PREVIEW_COUNT) {
       viewAllBtn = document.createElement("button");
@@ -371,12 +534,10 @@
       viewAllBtn.setAttribute("aria-controls", imagesId);
     }
 
-    // ---- Assemble ----
     card.appendChild(header);
     card.appendChild(imageContainer);
     if (viewAllBtn) card.appendChild(viewAllBtn);
 
-    // ---- View all toggle ----
     if (viewAllBtn) {
       viewAllBtn.addEventListener("click", function () {
         var restGrid = imageContainer.querySelectorAll(".image-grid")[1];
@@ -400,14 +561,12 @@
   }
 
   // ------------------------------------------------------------------
-  // Tile creation (fixed load-order bug)
+  // Tile creation
   // ------------------------------------------------------------------
 
-  // Tile height — 3x taller than typical thumbnail
   var TILE_HEIGHT = 640;
 
   function getTileHeight() {
-    // smaller on mobile
     if (window.innerWidth < 480) return 400;
     if (window.innerWidth < 768) return 500;
     return TILE_HEIGHT;
@@ -432,7 +591,6 @@
     img.style.width = tileW + "px";
     img.style.height = tileH + "px";
 
-    // Bind events BEFORE setting src
     img.addEventListener("load", function () {
       img.classList.add("loaded");
     });
@@ -453,9 +611,6 @@
 
     tile.appendChild(img);
     tile.addEventListener("click", function () {
-      console.log("[app] tile clicked, dyn.id:", dyn.id, "idx:", idx, "dyn.images count:", (dyn.images || []).length);
-      console.log("[app] meta.index (api):", meta.index, "meta.r2Key:", meta.r2Key);
-      console.log("[app] R2_BASE:", R2_BASE);
       window.openViewer(dyn.images || [], idx);
     });
     return tile;
@@ -477,9 +632,8 @@
         render(filterIds);
       }
     });
-    var input = document.getElementById("searchInput");
-    if (input && input.value.trim()) {
-      input.dispatchEvent(new Event("input", { bubbles: true }));
+    if (searchInput && searchInput.value.trim()) {
+      searchInput.dispatchEvent(new Event("input", { bubbles: true }));
     }
   }
 
@@ -487,10 +641,20 @@
   // Init
   // ------------------------------------------------------------------
 
-  console.log("[app] init, ARCHIVE_CONFIG:", window.ARCHIVE_CONFIG);
-  console.log("[app] R2_BASE:", R2_BASE);
-  console.log("[app] PREVIEW_COUNT:", PREVIEW_COUNT, "TILE_HEIGHT:", TILE_HEIGHT);
+  window.addEventListener("beforeunload", function () {
+    rememberScroll();
+    rememberRoute(currentRoute);
+  });
 
-  fetchData();
+  var initial = parseRoute(window.location.pathname);
+  if (initial) {
+    currentRoute = initial;
+    rememberRoute(initial);
+    updateShell();
+    loadRoute(initial);
+  } else {
+    // "/" or unknown → redirect to last route (default /ak/)
+    redirectToLast();
+  }
 
 })();
