@@ -22,6 +22,10 @@
   --c-btn-bg: #f3f4f6;
   --c-btn-hover: #e5e7eb;
   --c-footer: #9ca3af;
+  --acc-ak: #74dfec;
+  --acc-ef: #faef0f;
+  --acc-ak-deep: #1b5560;
+  --acc-ef-deep: #6d6510;
   --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.04);
   --shadow-card-hover: 0 2px 12px rgba(0, 0, 0, 0.06);
   --shadow-tile: 0 1px 4px rgba(0,0,0,0.06);
@@ -48,6 +52,8 @@
   --c-btn-bg: #1e293b;
   --c-btn-hover: #334155;
   --c-footer: #64748b;
+  --acc-ak-deep: #1b5560;
+  --acc-ef-deep: #6d6510;
   --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.2);
   --shadow-card-hover: 0 2px 12px rgba(0, 0, 0, 0.3);
   --shadow-tile: 0 1px 4px rgba(0,0,0,0.3);
@@ -143,25 +149,70 @@ input { font-family: inherit; }
   gap: 8px;
 }
 
-.account-nav,
-.page-nav {
+/* ------------------------------------------------------------------
+   Segmented switch (account & page nav) — plan C2
+   ------------------------------------------------------------------ */
+.seg-control {
+  --acc: var(--acc-ak);
+  --acc-deep: var(--acc-ak-deep);
+  position: relative;
   display: flex;
-  align-items: center;
-  gap: 6px;
+  width: 200px;
+  height: 40px;
+  border-radius: 20px;
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  overflow: hidden;
+  user-select: none;
+}
+body[data-account="ef"] .seg-control {
+  --acc: var(--acc-ef);
+  --acc-deep: var(--acc-ef-deep);
 }
 
-.nav-btn {
-  padding: 6px 14px;
-  border-radius: 16px;
+.seg-thumb {
+  position: absolute;
+  top: 2px; left: 2px; bottom: 2px;
+  width: calc(50% - 4px);
+  border-radius: 18px;
+  background: linear-gradient(180deg, var(--acc), #ffffff);
+  box-shadow:
+    0 4px 9px color-mix(in srgb, var(--acc) 62%, transparent),
+    inset 0 2px 4px rgba(0, 0, 0, 0.22);
+  transition: transform 0.28s cubic-bezier(0.4, 0.1, 0.2, 1);
+  z-index: 1;
+}
+[data-theme="dark"] .seg-thumb {
+  background: linear-gradient(180deg, var(--acc-deep), var(--c-surface));
+  box-shadow:
+    0 4px 9px color-mix(in srgb, var(--acc-deep) 62%, transparent),
+    inset 0 2px 4px rgba(0, 0, 0, 0.35);
+}
+.seg-control:hover .seg-thumb {
+  box-shadow:
+    0 5px 11px color-mix(in srgb, var(--acc) 88%, transparent),
+    inset 0 2px 4px rgba(0, 0, 0, 0.22);
+}
+[data-theme="dark"] .seg-control:hover .seg-thumb {
+  box-shadow:
+    0 5px 11px color-mix(in srgb, var(--acc-deep) 88%, transparent),
+    inset 0 2px 4px rgba(0, 0, 0, 0.35);
+}
+.seg-control[data-on="1"] .seg-thumb { transform: translateX(100%); }
+
+.seg-control .nav-btn {
+  flex: 1;
+  position: relative;
+  z-index: 2;
+  border: none;
+  background: none;
   font-size: 0.82rem;
-  background: var(--c-btn-bg);
   color: var(--c-text-dim);
   white-space: nowrap;
-  transition: background 0.2s, color 0.2s;
+  transition: color 0.2s;
 }
-.nav-btn:hover { background: var(--c-btn-hover); color: var(--c-text); }
-.nav-btn.active {
-  background: var(--c-btn-hover);
+.seg-control .nav-btn:hover { color: var(--c-text); }
+.seg-control .nav-btn.active {
   color: var(--c-text);
   font-weight: 600;
 }
@@ -180,16 +231,40 @@ input { font-family: inherit; }
 [data-theme="light"] .theme-toggle .icon-sun,
 [data-theme="dark"]  .theme-toggle .icon-moon { display: none; }
 
-.page-switch {
-  padding: 6px 14px;
-  border-radius: 16px;
-  font-size: 0.82rem;
-  background: var(--c-btn-bg);
-  color: var(--c-text-dim);
-  white-space: nowrap;
-  transition: background 0.2s, color 0.2s;
+/* ------------------------------------------------------------------
+   Floating scrollbar (no track — thumb only, fade in/out)
+   ------------------------------------------------------------------ */
+html {
+  scrollbar-width: none;
 }
-.page-switch:hover { background: var(--c-btn-hover); color: var(--c-text); text-decoration: none; }
+html::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.floating-scrollbar {
+  --acc: var(--acc-ak);
+  position: fixed;
+  top: 0; right: 3px; bottom: 0;
+  width: 10px;
+  z-index: 950;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  pointer-events: none;
+}
+body[data-account="ef"] .floating-scrollbar { --acc: var(--acc-ef); }
+.floating-scrollbar.visible { opacity: 1; }
+
+.floating-scrollbar .fs-thumb {
+  position: absolute;
+  left: 1px; right: 1px;
+  border-radius: 4px;
+  background: linear-gradient(180deg, var(--acc), color-mix(in srgb, var(--acc) 60%, #ffffff));
+  box-shadow:
+    0 2px 6px color-mix(in srgb, var(--acc) 45%, transparent),
+    inset 0 1px 2px rgba(255, 255, 255, 0.5);
+}
 
 /* ------------------------------------------------------------------
    Route fade transition (SPA)
@@ -639,6 +714,11 @@ input { font-family: inherit; }
   .header-inner { padding: 8px 14px; }
   .site-title { font-size: 0.95rem; }
 
+  .seg-control { width: 150px; height: 36px; border-radius: 18px; }
+  .seg-thumb { border-radius: 16px; }
+  .seg-control .nav-btn { font-size: 0.76rem; }
+  .header-controls { gap: 6px; }
+
   .search-bar { padding: 10px 14px; top: 50px; }
   .search-input { max-width: 100%; }
 
@@ -656,4 +736,6 @@ input { font-family: inherit; }
 @media (max-width: 480px) {
   .image-tile { border-radius: 6px; }
   .site-subtitle { display: none; }
+  .seg-control { width: 120px; }
+  .theme-toggle { width: 32px; height: 32px; }
 }

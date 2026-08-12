@@ -16,8 +16,8 @@
       <p class="site-subtitle">最近更新的 <span id="headerCount">—</span> 条动态 · <span id="headerTime">—</span></p>
     </div>
     <div class="header-controls">
-      <nav class="account-nav" id="accountNav" aria-label="账号切换"></nav>
-      <nav class="page-nav" id="pageNav" aria-label="页面切换"></nav>
+      <nav class="seg-control account-nav" id="accountNav" aria-label="账号切换"></nav>
+      <nav class="seg-control page-nav" id="pageNav" aria-label="页面切换"></nav>
       <button class="theme-toggle" id="themeToggle" title="切换主题" aria-label="切换深浅色主题">
         <span class="icon-sun">☀</span>
         <span class="icon-moon">☾</span>
@@ -89,6 +89,10 @@
   <div class="lb-tip" id="lbTip" hidden>滚轮缩放 &middot; 拖拽移动 &middot; Shift+滚轮上下 &middot; 方向键切换</div>
   <div class="lb-zoom-badge" id="lbZoomBadge" hidden></div>
   <div class="lb-thumb-strip" id="lbThumbStrip"></div>
+</div>
+
+<div class="floating-scrollbar" id="floatingScrollbar" aria-hidden="true">
+  <div class="fs-thumb" id="fsThumb"></div>
 </div>
 
 <script src="/js/config.js"></script>

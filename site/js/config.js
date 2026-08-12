@@ -6,6 +6,7 @@ window.ARCHIVE_CONFIG = {
   ACCOUNTS: {
     ak: {
       label: "朝陇山",
+      color: "#74dfec",
       index: "/site/index.json",
       search: "/site/search-index.json",
       figures: "/site/figures-index.json",
@@ -13,6 +14,7 @@ window.ARCHIVE_CONFIG = {
     },
     ef: {
       label: "山团团",
+      color: "#faef0f",
       index: "/endfield/site/index.json",
       search: "/endfield/site/search-index.json",
       figures: "/endfield/site/figures-index.json",

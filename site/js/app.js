@@ -106,26 +106,30 @@
     }
   }
 
-  function renderNav() {
-    accountNav.innerHTML = "";
-    pageNav.innerHTML = "";
-    Object.keys(CFG.ACCOUNTS).forEach(function (acc) {
+  function buildSeg(container, items, activeIndex, onSelect) {
+    container.innerHTML = '<span class="seg-thumb"></span>';
+    items.forEach(function (item, i) {
       var b = document.createElement("button");
-      b.className = "nav-btn" + (acc === currentRoute.account ? " active" : "");
-      b.textContent = CFG.ACCOUNTS[acc].label;
-      b.addEventListener("click", function () {
-        navigateTo({ account: acc, page: currentRoute.page });
-      });
-      accountNav.appendChild(b);
+      b.className = "nav-btn" + (i === activeIndex ? " active" : "");
+      b.textContent = item.label;
+      b.addEventListener("click", function () { onSelect(i, item); });
+      container.appendChild(b);
     });
-    ["main", "figures"].forEach(function (page) {
-      var b = document.createElement("button");
-      b.className = "nav-btn" + (page === currentRoute.page ? " active" : "");
-      b.textContent = page === "figures" ? "手办" : "全部";
-      b.addEventListener("click", function () {
-        navigateTo({ account: currentRoute.account, page: page });
-      });
-      pageNav.appendChild(b);
+    container.setAttribute("data-on", String(activeIndex));
+  }
+
+  function renderNav() {
+    var accList = Object.keys(CFG.ACCOUNTS).map(function (acc) {
+      return { key: acc, label: CFG.ACCOUNTS[acc].label };
+    });
+    var accIdx = accList.findIndex(function (a) { return a.key === currentRoute.account; });
+    buildSeg(accountNav, accList, accIdx, function (i) {
+      navigateTo({ account: accList[i].key, page: currentRoute.page });
+    });
+    var pages = [{ key: "main", label: "全部" }, { key: "figures", label: "手办" }];
+    var pageIdx = pages.findIndex(function (p) { return p.key === currentRoute.page; });
+    buildSeg(pageNav, pages, pageIdx, function (i) {
+      navigateTo({ account: currentRoute.account, page: pages[i].key });
     });
   }
 
@@ -134,6 +138,7 @@
     var title = acc.label + (currentRoute.page === "figures" ? "手办预售归档" : "图片归档");
     siteTitle.textContent = title;
     document.title = title + " - 明日方舟周边图片归档";
+    document.body.setAttribute("data-account", currentRoute.account);
     renderNav();
   }
 
@@ -259,6 +264,10 @@
       if (routeTarget) {
         setTimeout(function () { navigateToDynamic(routeTarget); }, FADE_MS + 60);
       }
+      setTimeout(function () {
+        updateFsThumb();
+        showFsBar();
+      }, FADE_MS + 80);
     })
     .catch(function (err) {
       console.error("Fetch error:", err);
@@ -635,6 +644,85 @@
     if (searchInput && searchInput.value.trim()) {
       searchInput.dispatchEvent(new Event("input", { bubbles: true }));
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Floating scrollbar (thumb only, fade in/out on scroll & hover)
+  // ------------------------------------------------------------------
+
+  var fsBar = document.getElementById("floatingScrollbar");
+  var fsThumb = document.getElementById("fsThumb");
+  var fsHideTimer = null;
+  var FS_HIDE_DELAY = 600;
+
+  function updateFsThumb() {
+    if (!fsBar || !fsThumb) return;
+    var doc = document.documentElement;
+    var scrollH = Math.max(doc.scrollHeight, document.body.scrollHeight);
+    var viewH = window.innerHeight;
+    var scrollTop = window.pageYOffset || doc.scrollTop || 0;
+    var trackH = fsBar.clientHeight;
+    var maxScroll = scrollH - viewH;
+    if (maxScroll <= 0) {
+      fsThumb.style.height = "0px";
+      fsThumb.style.top = "0px";
+      return;
+    }
+    var th = Math.max(24, trackH * viewH / scrollH);
+    fsThumb.style.height = th + "px";
+    var maxTop = trackH - th;
+    fsThumb.style.top = (scrollTop / maxScroll) * maxTop + "px";
+  }
+
+  function showFsBar() {
+    if (!fsBar) return;
+    fsBar.classList.add("visible");
+    clearTimeout(fsHideTimer);
+    fsHideTimer = setTimeout(function () { fsBar.classList.remove("visible"); }, FS_HIDE_DELAY);
+  }
+
+  function showFsBarKeep() {
+    if (!fsBar) return;
+    fsBar.classList.add("visible");
+    clearTimeout(fsHideTimer);
+  }
+
+  window.addEventListener("scroll", function () {
+    updateFsThumb();
+    showFsBar();
+  }, { passive: true });
+
+  window.addEventListener("resize", updateFsThumb);
+
+  if (fsBar) {
+    fsBar.addEventListener("mouseenter", showFsBarKeep);
+    fsBar.addEventListener("mouseleave", function () {
+      clearTimeout(fsHideTimer);
+      fsHideTimer = setTimeout(function () { fsBar.classList.remove("visible"); }, FS_HIDE_DELAY);
+    });
+    fsThumb.addEventListener("mousedown", function (e) {
+      e.preventDefault();
+      var doc = document.documentElement;
+      var startY = e.clientY;
+      var startTop = window.pageYOffset || doc.scrollTop || 0;
+      var maxScroll = Math.max(doc.scrollHeight, document.body.scrollHeight) - window.innerHeight;
+      var trackH = fsBar.clientHeight;
+      var th = fsThumb.clientHeight;
+      var maxTop = trackH - th;
+
+      function onMove(ev) {
+        var ratio = (ev.clientY - startY) / (maxTop || 1);
+        window.scrollTo(0, startTop + ratio * maxScroll);
+      }
+      function onUp() {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        document.body.style.userSelect = "";
+      }
+      document.body.style.userSelect = "none";
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
   }
 
   // ------------------------------------------------------------------
