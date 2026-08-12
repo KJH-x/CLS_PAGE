@@ -8,6 +8,7 @@ __pycache__/
 *.webp
 temp/
 .DS_Store
+local_archive/
 _debug_raw.json
 scripts/_test_extract.py
 scripts/_test_title.py

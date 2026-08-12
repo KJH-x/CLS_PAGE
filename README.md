@@ -36,7 +36,20 @@ Cloudflare Pages + Cloudflare R2. No Workers.
 /manifests/previous.json             — Backup manifest (for rollback)
 /images/{dynamicId}/{n}.jpg          — Full-size compressed images
 /thumbs/{dynamicId}/{n}.jpg          — Thumbnails (1/2 original)
+/smthumbs/{dynamicId}/{n}.jpg        — Low-detail small thumbs (1/8 original)
 ```
+
+## Local Archive (on-disk mirror)
+
+Newly downloaded images are also written locally under `local_archive/` (gitignored):
+
+```
+local_archive/images/{dynamicId}/{n}.jpg   — compressed copy (same as R2 images/)
+local_archive/cache/{sha256}-{dynamicId}-{n}.{ext} — original bytes, keyed by
+                                                     content hash + dynamic id
+```
+
+Set `LOCAL_ARCHIVE_DIR` to override the default `local_archive/` directory.
 
 ## Local Testing
 
@@ -63,6 +76,8 @@ pip install -r scripts/requirements.txt
 | `R2_ACCOUNT_ID` | Cloudflare Account ID |
 | `BILIBILI_COOKIE` | Bilibili cookie string (`key=val; key=val; ...`) |
 | `BILIBILI_UID` | Target Bilibili user ID |
+| `ARCHIVE_MODE` | `cls` (朝陇山) or `endfield` (山团团); controls title/category rules |
+| `LOCAL_ARCHIVE_DIR` | On-disk mirror dir (default `local_archive/` under repo) |
 | `KEEP_RECENT` | Max dynamics to keep in index (default 10) |
 | `OUTPUT_PREFIX` | Optional isolated R2 namespace for staging runs |
 | `DRY_RUN` | If non-empty, perform reads/downloads but skip every R2 write |
@@ -142,3 +157,21 @@ assert len(idx['dynamics']) == idx['totalDynamics'], 'dynamic count mismatch'
 print('OK')
 "
 ```
+
+### Small Thumb Backfill
+
+Grid tiles lazily load an 1/8-resolution `smthumbs/` image; the full original is
+fetched only when the lightbox is opened. New collections generate these
+automatically, but for images archived before this feature you can backfill:
+
+```bash
+python scripts/backfill_small_thumbs.py                 # both accounts
+python scripts/backfill_small_thumbs.py --accounts=ef   # 山团团 only
+python scripts/backfill_small_thumbs.py --accounts=ak   # 朝陇山 only
+python scripts/backfill_small_thumbs.py --dry-run       # preview without writing
+```
+
+The script reads source bytes from the local compressed mirror
+(`local_archive/images/...`) when available and falls back to R2. It is
+idempotent — images that already have a valid `smallThumbKey` are skipped — and
+updates the index JSON + manifest object list after completion.

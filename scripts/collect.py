@@ -15,9 +15,11 @@ run can therefore leave unreferenced objects, but it cannot publish an index wit
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
+import pathlib
 import random
 import re
 import sys
@@ -70,11 +72,16 @@ _REQUEST_MAX_ATTEMPTS = _env_int("REQUEST_MAX_ATTEMPTS", "3")
 _BACKOFF_BASE_SECONDS = _env_float("BACKOFF_BASE_SECONDS", "1")
 _API_PAGE_DELAY_SECONDS = _env_float("API_PAGE_DELAY_SECONDS", "0.4")
 _IMAGE_DELAY_SECONDS = _env_float("IMAGE_DELAY_SECONDS", "0.15")
+_LOCAL_ARCHIVE_DIR = os.environ.get(
+    "LOCAL_ARCHIVE_DIR",
+    str(pathlib.Path(__file__).resolve().parents[1] / "local_archive"),
+)
 
 DISPLAY_WIDTH_SCALE = 1  # no horizontal downsampling
 JPEG_QUALITY = 35
 THUMB_QUALITY = 40
 THUMB_SCALE = 2  # thumbnail = 1/2 original width & height
+SMALL_THUMB_SCALE = 8  # small thumb = 1/8 original width & height
 MAX_API_PAGES = 20
 DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -720,6 +727,66 @@ def make_thumbnail(raw: bytes) -> Optional[bytes]:
         return None
 
 
+def make_small_thumbnail(raw: bytes) -> Optional[bytes]:
+    """Generate a low-detail 1/8 thumbnail for lazy-loaded grid tiles."""
+    try:
+        img = Image.open(io.BytesIO(raw))
+        orig_w, orig_h = img.size
+        small_w = max(1, orig_w // SMALL_THUMB_SCALE)
+        small_h = max(1, orig_h // SMALL_THUMB_SCALE)
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        img = img.resize((small_w, small_h), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True, progressive=True, subsampling="4:2:0")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Local archive (compressed copy + original cache keyed by hash+dynamic id)
+# ---------------------------------------------------------------------------
+
+def _local_path(*parts: str) -> pathlib.Path:
+    return pathlib.Path(_LOCAL_ARCHIVE_DIR, *parts)
+
+
+def local_save_compressed(dyn_id: str, idx: int, data: bytes) -> Optional[pathlib.Path]:
+    """Write the compressed image to local_archive/images/{dynId}/{idx}.jpg."""
+    try:
+        p = _local_path("images", dyn_id, f"{idx}.jpg")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return p
+    except Exception as exc:
+        log(f"      WARN: local compressed save failed: {exc}")
+        return None
+
+
+def local_save_original(dyn_id: str, idx: int, raw: bytes) -> Optional[pathlib.Path]:
+    """Cache the original bytes as local_archive/cache/{sha256}-{dynId}-{idx}.{ext}."""
+    try:
+        digest = hashlib.sha256(raw).hexdigest()
+        fmt = ""
+        try:
+            with Image.open(io.BytesIO(raw)) as im:
+                fmt = (im.format or "").lower()
+        except Exception:
+            fmt = ""
+        ext = {"jpeg": "jpg", "webp": "webp", "png": "png", "gif": "gif"}.get(fmt, "img")
+        p = _local_path("cache", f"{digest}-{dyn_id}-{idx}.{ext}")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(raw)
+        return p
+    except Exception as exc:
+        log(f"      WARN: local original save failed: {exc}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -899,10 +966,23 @@ def main() -> None:
                 if old_thumb_key and not r2_head(old_thumb_key):
                     log(f"  [{dyn['id'][:16]}] img {idx} — thumbnail missing; using full image fallback")
                     old_thumb_key = ""
+                old_small_key = old_meta.get("smallThumbKey", "")
+                if old_small_key and not r2_head(old_small_key):
+                    old_small_key = ""
+                if not old_small_key:
+                    # Backfill: generate 1/8 small thumb from the full R2 image
+                    full_bytes = r2_get_bytes(r2_key)
+                    small_key = _pk(f"smthumbs/{dyn['id']}/{idx}.jpg")
+                    small_data = make_small_thumbnail(full_bytes or b"")
+                    if small_data:
+                        r2_put_image(small_key, small_data)
+                        old_small_key = small_key
+                        log(f"  [{dyn['id'][:16]}] img {idx} — small thumb backfilled")
                 meta = {
                     "index": idx,
                     "r2Key": r2_key,
                     "thumbnailKey": old_thumb_key,
+                    "smallThumbKey": old_small_key,
                     "originalWidth": old_meta.get("originalWidth", 0),
                     "originalHeight": old_meta.get("originalHeight", 0),
                     "storedWidth": old_meta.get("storedWidth", 0),
@@ -914,6 +994,8 @@ def main() -> None:
                 tracked_objects.add(r2_key)
                 if meta["thumbnailKey"]:
                     tracked_objects.add(meta["thumbnailKey"])
+                if meta["smallThumbKey"]:
+                    tracked_objects.add(meta["smallThumbKey"])
                 stats_recovered += 1
                 log(f"  [{dyn['id'][:16]}] img {idx} — recovered from old index")
                 continue
@@ -929,11 +1011,25 @@ def main() -> None:
                 old_thumb_key = old_meta.get("thumbnailKey", "")
                 if old_thumb_key and not r2_head(old_thumb_key):
                     old_meta["thumbnailKey"] = ""
+                old_small_key = old_meta.get("smallThumbKey", "")
+                if old_small_key and not r2_head(old_small_key):
+                    old_meta["smallThumbKey"] = ""
+                if not old_meta.get("smallThumbKey"):
+                    full_bytes = r2_get_bytes(r2_key)
+                    small_key = _pk(f"smthumbs/{dyn['id']}/{idx}.jpg")
+                    small_data = make_small_thumbnail(full_bytes or b"")
+                    if small_data:
+                        r2_put_image(small_key, small_data)
+                        old_meta["smallThumbKey"] = small_key
+                        log(f"    Small thumb backfilled")
                 images.append(old_meta)
                 tracked_objects.add(r2_key)
                 tk = old_meta.get("thumbnailKey", "")
                 if tk:
                     tracked_objects.add(tk)
+                sk = old_meta.get("smallThumbKey", "")
+                if sk:
+                    tracked_objects.add(sk)
                 stats_recovered += 1
                 log(f"    Recovered from old index metadata")
                 continue
@@ -946,10 +1042,19 @@ def main() -> None:
                     stored_w, stored_h = api_w, api_h
                 thumb_key = _pk(f"thumbs/{dyn['id']}/{idx}.jpg")
                 thumb_exists = r2_head(thumb_key)
+                small_key = _pk(f"smthumbs/{dyn['id']}/{idx}.jpg")
+                small_exists = r2_head(small_key)
+                if not small_exists:
+                    small_data = make_small_thumbnail(existing_bytes or b"")
+                    if small_data:
+                        r2_put_image(small_key, small_data)
+                        small_exists = True
+                        log(f"    Small thumb backfilled")
                 meta = {
                     "index": idx,
                     "r2Key": r2_key,
                     "thumbnailKey": thumb_key if thumb_exists else "",
+                    "smallThumbKey": small_key if small_exists else "",
                     "originalWidth": max(api_w, stored_w),
                     "originalHeight": max(api_h, stored_h),
                     "storedWidth": stored_w,
@@ -961,6 +1066,8 @@ def main() -> None:
                 tracked_objects.add(r2_key)
                 if meta["thumbnailKey"]:
                     tracked_objects.add(meta["thumbnailKey"])
+                if meta["smallThumbKey"]:
+                    tracked_objects.add(meta["smallThumbKey"])
                 stats_recovered += 1
                 log(f"    Recovered from R2 ({stored_w}x{stored_h})")
                 continue
@@ -979,6 +1086,11 @@ def main() -> None:
             meta["index"] = idx
             meta["r2Key"] = r2_key
 
+            # Local archive: compressed copy + original cache (hash + dynamic id)
+            if not _DRY_RUN:
+                local_save_compressed(dyn["id"], idx, compressed)
+                local_save_original(dyn["id"], idx, raw)
+
             # Generate and upload thumbnail
             thumb_key = _pk(f"thumbs/{dyn['id']}/{idx}.jpg")
             thumb_data = make_thumbnail(raw)
@@ -989,6 +1101,17 @@ def main() -> None:
                 log(f"    Thumbnail: {thumb_key}")
             else:
                 meta["thumbnailKey"] = ""
+
+            # Generate and upload low-detail small thumbnail (1/8)
+            small_key = _pk(f"smthumbs/{dyn['id']}/{idx}.jpg")
+            small_data = make_small_thumbnail(raw)
+            if small_data:
+                r2_put_image(small_key, small_data)
+                meta["smallThumbKey"] = small_key
+                tracked_objects.add(small_key)
+                log(f"    Small thumb: {small_key}")
+            else:
+                meta["smallThumbKey"] = ""
 
             r2_put_image(r2_key, compressed)
             images.append(meta)

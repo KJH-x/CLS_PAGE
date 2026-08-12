@@ -320,6 +320,18 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(get.call_count, 2)
         sleep.assert_called_once_with(0.0)
 
+    def test_make_small_thumbnail_is_one_eighth(self):
+        import io as _io
+        from PIL import Image as _Image
+        buf = _io.BytesIO()
+        _Image.new("RGB", (800, 1600), (10, 20, 30)).save(buf, format="JPEG")
+        raw = buf.getvalue()
+
+        small = collect.make_small_thumbnail(raw)
+        self.assertIsNotNone(small)
+        img = _Image.open(_io.BytesIO(small))
+        self.assertEqual(img.size, (100, 200))  # 800/8 x 1600/8
+
     def test_page_cap_marks_pagination_incomplete(self):
         payload = {
             "code": 0,

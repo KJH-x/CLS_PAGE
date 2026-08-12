@@ -613,7 +613,8 @@
       tile.appendChild(ph);
     });
 
-    img.src = R2_BASE + "/" + (meta.thumbnailKey || meta.r2Key || "");
+    // Grid preview: use the 1/8 small thumb; full original only loads in the viewer.
+    img.src = R2_BASE + "/" + (meta.smallThumbKey || meta.thumbnailKey || meta.r2Key || "");
 
     if (img.complete) {
       img.classList.add("loaded");
