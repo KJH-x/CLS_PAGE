@@ -9,6 +9,8 @@
 </head>
 <body>
 
+<a class="skip-link" href="#mainContent">跳到主要内容</a>
+
 <header class="site-header">
   <div class="header-inner">
     <div class="header-left">
@@ -31,17 +33,21 @@
     type="search"
     id="searchInput"
     class="search-input"
-    placeholder="搜索标题、标签或日期，例如 预售"
+    placeholder="搜索标题、正文、标签或日期，例如 预售"
     autocomplete="off"
     aria-label="搜索动态"
   />
   <button class="search-clear" id="searchClear" hidden aria-label="清除搜索">✕</button>
-  <span class="search-status" id="searchStatus"></span>
+  <label class="all-site-toggle" title="同时检索两个账号">
+    <input type="checkbox" id="allSiteToggle" aria-label="全站检索" />
+    <span>全站</span>
+  </label>
+  <span class="search-status" id="searchStatus" aria-live="polite"></span>
 </div>
 
 <div class="filter-bar" id="filterBar"></div>
 
-<main class="main-content">
+<main class="main-content" id="mainContent" tabindex="-1">
   <div class="loading-state" id="loadingState" hidden>
     <div class="skeleton-card" aria-hidden="true">
       <div class="skel-line w-30"></div>
@@ -89,6 +95,14 @@
   <div class="lb-tip" id="lbTip" hidden>滚轮缩放 &middot; 拖拽移动 &middot; Shift+滚轮上下 &middot; 方向键切换</div>
   <div class="lb-zoom-badge" id="lbZoomBadge" hidden></div>
   <div class="lb-thumb-strip" id="lbThumbStrip"></div>
+  <div class="lb-info" id="lbInfo" hidden>
+    <div class="lb-info-title" id="lbInfoTitle"></div>
+    <div class="lb-info-size" id="lbInfoSize"></div>
+    <div class="lb-info-links">
+      <a class="lb-info-original" id="lbInfoOriginal" target="_blank" rel="noopener noreferrer">原动态</a>
+      <button class="lb-info-copy" id="lbInfoCopy" type="button">复制链接</button>
+    </div>
+  </div>
 </div>
 
 <div class="floating-scrollbar" id="floatingScrollbar" aria-hidden="true">

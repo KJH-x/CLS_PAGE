@@ -44,7 +44,20 @@
   var activeSearchIds = null;
   var currentRoute = null;      // {account, page}
   var routeTarget = null;
+  var pendingTarget = null;     // /to/ 未决目标（供 loadRoute 异步解析）
+  var resolveToken = 0;         // 递增以取消过期的跨账号解析
+  var routeIndexCache = {};     // "account:page" → 已归一化 index 数据（会话内缓存）
   var searchInput = document.getElementById("searchInput");
+  var allSiteToggle = document.getElementById("allSiteToggle");
+  var fromEl = null;            // date-range controls, built by initFilterBar
+  var toEl = null;
+  var sortEl = null;
+  var urlSyncTimer = null;
+  // R8 infinite-scroll batch state
+  var RENDER_BATCH = 30;
+  var batchState = null;
+  var batchObserver = null;
+  var batchSentinel = null;
 
   var ROUTE_PATHS = {
     "ak": { main: "/ak/", figures: "/ak-figures/" },
@@ -60,6 +73,32 @@
     if (pathname.indexOf("/ak") === 0) return { account: "ak", page: "main" };
     if (pathname.indexOf("/ef-figures") === 0) return { account: "ef", page: "figures" };
     if (pathname.indexOf("/ef") === 0) return { account: "ef", page: "main" };
+    return null;
+  }
+
+  // /to/{account}/{slug}/  (new)  and  /to/{slug}/  (legacy, README.md:20)
+  function parseToTarget(pathname) {
+    var seg = pathname.match(/^\/to\/([^/]+)\/([^/]+)\/?$/);
+    if (seg) {
+      var acc = seg[1];
+      if (CFG.ACCOUNTS[acc]) {                       // 第一段必须是已知账号，否则按旧格式继续
+        try { return { account: acc, slug: decodeURIComponent(seg[2]) }; }
+        catch (err) { return null; }
+      }
+    }
+    var legacy = pathname.match(/^\/to\/([^/]+)\/?$/);
+    if (legacy) {
+      try { return { slug: decodeURIComponent(legacy[1]) }; }
+      catch (err) { return null; }
+    }
+    return null;
+  }
+
+  function routeTargetFromLocation() {
+    var to = parseToTarget(window.location.pathname);
+    if (to) return { slug: to.slug, account: to.account || null };
+    var hashMatch = window.location.hash.match(/^#id-(.+)$/);
+    if (hashMatch) return { id: hashMatch[1] };      // 与现状一致：id 不回显 decode（纯数字）
     return null;
   }
 
@@ -144,6 +183,7 @@
 
   function navigateTo(route, opts) {
     opts = opts || {};
+    resolveToken++;                                  // 取消在途的跨账号解析
     if (currentRoute &&
         currentRoute.account === route.account &&
         currentRoute.page === route.page &&
@@ -163,7 +203,21 @@
 
   window.addEventListener("popstate", function () {
     var route = parseRoute(window.location.pathname);
-    if (!route) { redirectToLast(); return; }
+    if (!route) {
+      var to = parseToTarget(window.location.pathname);
+      if (to) {
+        var start = to.account
+          ? { account: to.account, page: "main" }
+          : (currentRoute || { account: "ak", page: "main" });
+        currentRoute = start;
+        rememberRoute(start);
+        updateShell();
+        loadRoute(start);
+        return;
+      }
+      redirectToLast();
+      return;
+    }
     currentRoute = route;
     rememberRoute(route);
     updateShell();
@@ -193,6 +247,7 @@
       btn.classList.toggle("active", btn.dataset.cat === cat);
     });
     render(activeSearchIds);
+    syncUrlState(false);
   }
 
   function initFilterBar() {
@@ -223,27 +278,72 @@
       b.addEventListener("click", function () { setCategory(cat); });
       bar.appendChild(b);
     });
+
+    // Date range + sort controls (R1)
+    var extras = document.createElement("div");
+    extras.className = "filter-extras";
+    fromEl = document.createElement("input");
+    fromEl.type = "date";
+    fromEl.id = "filterFrom";
+    fromEl.setAttribute("aria-label", "起始日期");
+    fromEl.addEventListener("change", function () {
+      render(activeSearchIds);
+      syncUrlState(false);
+    });
+    toEl = document.createElement("input");
+    toEl.type = "date";
+    toEl.id = "filterTo";
+    toEl.setAttribute("aria-label", "结束日期");
+    toEl.addEventListener("change", function () {
+      render(activeSearchIds);
+      syncUrlState(false);
+    });
+    sortEl = document.createElement("select");
+    sortEl.id = "filterSort";
+    sortEl.setAttribute("aria-label", "排序");
+    [["date-desc", "最新在前"], ["date-asc", "最早在前"], ["images-desc", "图片最多"]].forEach(function (o) {
+      var opt = document.createElement("option");
+      opt.value = o[0];
+      opt.textContent = o[1];
+      sortEl.appendChild(opt);
+    });
+    sortEl.value = "date-desc";
+    sortEl.addEventListener("change", function () {
+      render(activeSearchIds);
+      syncUrlState(false);
+    });
+    extras.appendChild(fromEl);
+    extras.appendChild(toEl);
+    extras.appendChild(sortEl);
+    bar.appendChild(extras);
   }
 
   function loadRoute(route) {
     showLoading();
     currentCategory = "";
     activeSearchIds = null;
+    var urlState = parseUrlState();
     if (searchInput) {
-      searchInput.value = "";
+      searchInput.value = urlState.q || "";
       var clearBtn = document.getElementById("searchClear");
-      if (clearBtn) clearBtn.hidden = true;
+      if (clearBtn) clearBtn.hidden = !urlState.q;
       var statusEl = document.getElementById("searchStatus");
       if (statusEl) statusEl.textContent = "";
+    }
+    var noResultsEl = document.getElementById("noResults");
+    if (noResultsEl) {
+      var np = noResultsEl.querySelector("p");
+      if (np) np.textContent = "没有匹配的动态";
+      var cb = document.getElementById("clearSearchBtn");
+      if (cb) cb.hidden = false;
     }
 
     timeline.classList.add("fade-out");
 
-    var indexUrl = R2_BASE + indexFile(route);
     var searchUrl = R2_BASE + searchFile(route);
 
     Promise.all([
-      fetch(indexUrl).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }),
+      fetchIndexFor(route),
       fetch(searchUrl).then(function (r) { return r.ok ? r.json() : Promise.resolve(null); }).catch(function () { return null; })
     ])
     .then(function (results) {
@@ -254,10 +354,14 @@
       hideLoading();
       setupSearch();
       initFilterBar();
+      applyUrlState();
       checkRoute();
       render();
       if (routeTarget) {
         navigateToDynamic(routeTarget);
+      }
+      if (pendingTarget) {
+        resolvePendingTarget();
       }
       setTimeout(fadeIn, FADE_MS);
       restoreScroll();
@@ -295,56 +399,205 @@
     return y + "-" + m + "-" + day;
   }
 
-  function getActivitySlug(text) {
-    var m = text.match(/[｜|](.+?)〓/);
-    return m ? m[1].trim() : "";
+  // --- Slug helpers (client mirror of collect.server_slug) ---
+
+  function normalizeSlug(text) {
+    var line = "";
+    var lines = String(text || "").split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var cleaned = lines[i].replace(/#[^#]+#/g, "").trim();
+      if (cleaned) { line = cleaned; break; }
+    }
+    line = line.replace(/\s+/g, " ").trim();
+    line = line.replace(/[^\w\u4e00-\u9fa5-]/g, "-"); // JS \w 仅 ASCII，等价 collect 的显式字符类
+    line = line.replace(/-+/g, "-").replace(/^-|-$/g, "");
+    return line;
   }
+
+  function buildSlug(dyn) {
+    if (dyn && dyn.slug) return dyn.slug;                 // 服务端权威值，先取（旧索引缺字段时走推导）
+    var text = (dyn && (dyn.text || dyn.fullText)) || "";
+    var m = text.match(/[｜|]([^〓▼]+)〓/);
+    if (m && m[1].trim()) return m[1].trim();            // ak 〓…〓
+    var m2 = text.match(/▼(.+?)▼/);
+    if (m2 && m2[1].trim()) return m2[1].trim();         // ef ▼…▼
+    var norm = normalizeSlug(text);
+    if (norm) return norm;                                // 归一化回退
+    return String((dyn && dyn.id) || "");
+  }
+
+  function buildDynamicLink(dyn) {
+    var account = (dyn && dyn._account) || (currentRoute && currentRoute.account) || "ak";
+    var slug = buildSlug(dyn);
+    if (!slug) return null;
+    return window.location.origin + "/to/" + account + "/" + encodeURIComponent(slug) + "/";
+  }
+
+  function copyTextFallback(text) {
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "0";
+    ta.style.left = "0";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
+  function copyText(text, onResult) {
+    function finish(ok) {
+      if (!ok) {
+        try { window.prompt("复制失败，请手动复制链接", text); } catch (e) { /* ignore */ }
+      }
+      if (onResult) onResult(!!ok);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { finish(true); },
+        function () { finish(copyTextFallback(text)); }
+      );
+      return;
+    }
+    finish(copyTextFallback(text));
+  }
+
+  // 暴露给 viewer.js 信息条复用
+  window.buildDynamicLink = buildDynamicLink;
+  window.copyText = copyText;
 
   // ------------------------------------------------------------------
   // Routing — open a specific dynamic via URL
   // ------------------------------------------------------------------
+  function matchTarget(dyn, target) {
+    if (target.id) return dyn.id === target.id;
+    if (target.slug) {
+      if (dyn.slug && dyn.slug === target.slug) return true;  // 服务端权威值直接比对
+      return buildSlug(dyn) === target.slug;                  // 旧索引回退：客户端推导
+    }
+    return false;
+  }
+
+  function resolveInDynamics(dynamics, target, account) {
+    for (var i = 0; i < dynamics.length; i++) {
+      var d = dynamics[i];
+      if (matchTarget(d, target)) { d._account = account; return d; }
+    }
+    return null;
+  }
+
+  // 解析候选队列：显式账号优先 → 同账号 figures → 另一账号兜底
+  function toResolutionQueue(target) {
+    var others = Object.keys(CFG.ACCOUNTS).filter(function (a) { return a !== currentRoute.account; });
+    var queue = [];
+    var pushed = {};
+    function push(a, p) {
+      var k = a + ":" + p;
+      if (pushed[k]) return;
+      if (a === currentRoute.account && p === currentRoute.page) return; // 已同步查过
+      pushed[k] = true;
+      queue.push({ account: a, page: p });
+    }
+    if (target.account && target.account !== currentRoute.account) {
+      push(target.account, "main");      // 显式账号优先：与 URL 意图一致
+      push(target.account, "figures");
+    }
+    push(currentRoute.account, "figures");                 // 同账号 figures
+    others.forEach(function (a) { push(a, "main"); push(a, "figures"); }); // 另一账号兜底
+    return queue;
+  }
+
   function checkRoute() {
+    routeTarget = null;          // 修复 routeTarget 陈旧残留
+    pendingTarget = null;
     if (!appData || !appData.dynamics) return;
 
-    var targetId = null;
-    var targetActivity = null;
+    var target = routeTargetFromLocation();
+    if (!target) return;
 
-    var pathMatch = window.location.pathname.match(/\/to\/(.+?)\/?$/);
-    if (pathMatch) {
-      try {
-        targetActivity = decodeURIComponent(pathMatch[1]);
-      } catch (err) {
-        console.warn("Ignoring malformed archive route", err);
-      }
-    }
-
-    var hashMatch = window.location.hash.match(/^#id-(.+)$/);
-    if (hashMatch) {
-      targetId = hashMatch[1];
-    }
-
-    if (!targetId && !targetActivity) return;
-
-    for (var i = 0; i < appData.dynamics.length; i++) {
-      var d = appData.dynamics[i];
-      if (targetId && d.id === targetId) { routeTarget = d; break; }
-      if (targetActivity && getActivitySlug(d.text) === targetActivity) { routeTarget = d; break; }
-    }
-
+    // 当前路由 appData 同步解析
+    routeTarget = resolveInDynamics(appData.dynamics, target, currentRoute.account);
     if (routeTarget) {
       currentCategory = "";
       document.querySelectorAll(".filter-btn").forEach(function (btn) {
         btn.classList.toggle("active", btn.dataset.cat === "");
       });
+      return;
+    }
+
+    // #id- 保持现状：仅当前路由解析；/to/ 才走跨账号/跨页异步队列
+    if (target.slug) {
+      pendingTarget = target;
     }
   }
 
-  function navigateToDynamic(dyn) {
-    var cleanPath = routePath(currentRoute);
-    var cleanUrl = window.location.origin + cleanPath;
-    if (window.location.pathname !== cleanPath || window.location.hash) {
-      history.replaceState(null, "", cleanUrl);
+  function fetchIndexFor(route) {
+    var key = route.account + ":" + route.page;
+    if (routeIndexCache[key]) return Promise.resolve(routeIndexCache[key]);
+    var url = R2_BASE + indexFile(route);
+    return fetch(url)
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (data) {
+        if (!data || !data.dynamics) throw new Error("Invalid index format");
+        data.dynamics = data.dynamics.map(normalizeDynamic);
+        routeIndexCache[key] = data;
+        return data;
+      });
+  }
+
+  function resolvePendingTarget() {
+    var target = pendingTarget;
+    if (!target) return;
+    pendingTarget = null;
+    var token = ++resolveToken;
+    var queue = toResolutionQueue(target);
+    var idx = 0;
+    var aborted = false;
+    function step() {
+      if (aborted || token !== resolveToken) return;   // 期间发生了新导航 → 放弃
+      if (idx >= queue.length) { showRouteMiss(); return; }
+      var cand = queue[idx++];
+      fetchIndexFor(cand).then(function (data) {
+        if (aborted || token !== resolveToken) return;
+        var dyn = resolveInDynamics(data.dynamics, target, cand.account);
+        if (dyn) { openResolvedTarget(dyn, cand); }
+        else { step(); }
+      }).catch(function () { step(); });
     }
+    step();
+  }
+
+  function openResolvedTarget(dyn, cand) {
+    // 命中的是另一路由：切过去（/to/ URL 保持），loadRoute 的 checkRoute 会同步二次命中
+    if (!currentRoute || currentRoute.account !== cand.account || currentRoute.page !== cand.page) {
+      currentRoute = { account: cand.account, page: cand.page };
+      rememberRoute(currentRoute);
+      updateShell();
+      loadRoute(currentRoute);
+      return;
+    }
+    routeTarget = dyn;
+    navigateToDynamic(dyn);
+  }
+
+  function showRouteMiss() {
+    var el = document.getElementById("noResults");
+    if (!el) return;
+    el.hidden = false;
+    var p = el.querySelector("p");
+    if (p) p.textContent = "未找到该动态（链接可能已失效）";
+    var btn = document.getElementById("clearSearchBtn");
+    if (btn) btn.hidden = true;
+  }
+
+  function navigateToDynamic(dyn) {
+    // 保留 /to/… 可分享 URL：不再改写回干净路由。不做 pushState → 不会触发 popstate 双加载。
+    if (!dyn._account) dyn._account = currentRoute.account;
 
     requestAnimationFrame(function () {
       var card = document.querySelector('.dynamic-card[data-id="' + dyn.id + '"]');
@@ -354,9 +607,12 @@
         card.scrollIntoView({ behavior: "smooth", block: "start" });
         setTimeout(function () {
           if (dyn.images && dyn.images.length > 0) {
-            window.openViewer(dyn.images, 0);
+            window.openViewer(dyn.images, 0, dyn);
           }
         }, 600);
+      } else if (dyn._account && dyn._account !== currentRoute.account) {
+        // 理论上跨账号命中后已切路由、卡片应在；此处仅防御性记录
+        console.warn("Dynamic not rendered on current route:", dyn.id);
       }
     });
   }
@@ -428,16 +684,82 @@
       });
     }
 
-    noResults.hidden = !(searchFilterIds || currentCategory) || visibleDynamics.length > 0;
+    var from = fromEl ? fromEl.value : "";
+    var to = toEl ? toEl.value : "";
+    if (from || to) {
+      visibleDynamics = visibleDynamics.filter(function (d) {
+        if (from && (!d.date || d.date < from)) return false;
+        if (to && (!d.date || d.date > to)) return false;
+        return true;
+      });
+    }
 
+    var sort = sortEl ? sortEl.value : "date-desc";
+    visibleDynamics = visibleDynamics.slice();
+    if (sort === "date-asc") {
+      visibleDynamics.sort(function (a, b) {
+        var byDate = (a.date || "").localeCompare(b.date || "");
+        if (byDate !== 0) return byDate;
+        return (b.timestamp || 0) - (a.timestamp || 0);
+      });
+    } else if (sort === "images-desc") {
+      visibleDynamics.sort(function (a, b) {
+        var byImgs = (b.imageCount || 0) - (a.imageCount || 0);
+        if (byImgs !== 0) return byImgs;
+        return (b.timestamp || 0) - (a.timestamp || 0);
+      });
+    } else {
+      visibleDynamics.sort(function (a, b) { return (b.timestamp || 0) - (a.timestamp || 0); });
+    }
+
+    var isFiltering = !!(searchFilterIds || currentCategory || from || to);
+    noResults.hidden = !isFiltering || visibleDynamics.length > 0;
+
+    // R8: batch render (~30 per chunk) + IntersectionObserver infinite scroll
     timeline.innerHTML = "";
-
-    visibleDynamics.forEach(function (dyn) {
-      var card = createCard(dyn);
-      timeline.appendChild(card);
-    });
-
+    removeBatchObserver();
+    batchState = { list: visibleDynamics, rendered: 0 };
+    renderNextBatch();
     updateFooter();
+  }
+
+  function renderNextBatch() {
+    if (!batchState) return;
+    var list = batchState.list;
+    var count = Math.min(RENDER_BATCH, list.length - batchState.rendered);
+    for (var i = 0; i < count; i++) {
+      timeline.appendChild(createCard(list[batchState.rendered + i]));
+    }
+    batchState.rendered += count;
+    updateFooter();
+    if (batchState.rendered < list.length) {
+      observeBatchSentinel();
+    } else {
+      removeBatchObserver();
+    }
+  }
+
+  function observeBatchSentinel() {
+    removeBatchObserver();
+    batchSentinel = document.createElement("div");
+    batchSentinel.className = "infinite-sentinel";
+    batchSentinel.setAttribute("aria-hidden", "true");
+    timeline.appendChild(batchSentinel);
+    if (!batchObserver && "IntersectionObserver" in window) {
+      batchObserver = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) renderNextBatch();
+        });
+      }, { rootMargin: "400px 0px" });
+    }
+    if (batchObserver) batchObserver.observe(batchSentinel);
+  }
+
+  function removeBatchObserver() {
+    if (batchObserver) { batchObserver.disconnect(); }
+    batchObserver = null;
+    if (batchSentinel && batchSentinel.parentNode) batchSentinel.parentNode.removeChild(batchSentinel);
+    batchSentinel = null;
   }
 
   function updateFooter() {
@@ -506,6 +828,22 @@
     linkEl.rel = "noopener noreferrer";
     linkEl.textContent = "原动态";
     metaRow.appendChild(linkEl);
+
+    var copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "copy-link";
+    copyBtn.textContent = "复制链接";
+    copyBtn.setAttribute("aria-label", "复制本条动态的站内链接");
+    copyBtn.addEventListener("click", function () {
+      var url = buildDynamicLink(dyn);
+      if (!url) return;
+      copyText(url, function () {
+        copyBtn.textContent = "已复制 ✓";
+        clearTimeout(copyBtn._t);
+        copyBtn._t = setTimeout(function () { copyBtn.textContent = "复制链接"; }, 1500);
+      });
+    });
+    metaRow.appendChild(copyBtn);
 
     header.appendChild(metaRow);
 
@@ -621,8 +959,18 @@
     }
 
     tile.appendChild(img);
-    tile.addEventListener("click", function () {
-      window.openViewer(dyn.images || [], idx);
+    tile.tabIndex = 0;
+    tile.setAttribute("role", "button");
+    tile.setAttribute("aria-label", (dyn.text || "存档图片") + " 第" + (idx + 1) + "张，打开查看");
+    function openFromTile() {
+      window.openViewer(dyn.images || [], idx, dyn);
+    }
+    tile.addEventListener("click", openFromTile);
+    tile.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openFromTile();
+      }
     });
     return tile;
   }
@@ -631,21 +979,142 @@
   // Search
   // ------------------------------------------------------------------
 
-  function setupSearch() {
-    window.initSearch(searchData || [], function (filterIds) {
-      if (!appData) return;
-      activeSearchIds = filterIds;
-      if (filterIds === null) {
-        render(null);
-        document.getElementById("noResults").hidden = true;
-        document.getElementById("searchStatus").textContent = "";
-      } else {
-        render(filterIds);
-      }
+  // ------------------------------------------------------------------
+  // Search
+  // ------------------------------------------------------------------
+
+  function onSearchResult(filterIds) {
+    if (!appData) return;
+    activeSearchIds = filterIds;
+    if (filterIds === null) {
+      render(null);
+      document.getElementById("noResults").hidden = true;
+      document.getElementById("searchStatus").textContent = "";
+    } else {
+      render(filterIds);
+    }
+  }
+
+  function currentTaggedSearch() {
+    var data = searchData || [];
+    return data.map(function (it) {
+      var c = Object.assign({}, it);
+      c._account = accountLabel(currentRoute.account);
+      return c;
     });
+  }
+
+  function fetchRemoteSearch(account) {
+    var url = R2_BASE + searchFile({ account: account, page: currentRoute.page });
+    return fetch(url)
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; })
+      .then(function (data) {
+        if (!data) return [];
+        return data.map(function (it) {
+          var c = Object.assign({}, it);
+          c._account = accountLabel(account);
+          return c;
+        });
+      });
+  }
+
+  function setupSearch() {
+    if (allSiteToggle && allSiteToggle.checked) {
+      var others = Object.keys(CFG.ACCOUNTS).filter(function (a) { return a !== currentRoute.account; });
+      Promise.all(others.map(fetchRemoteSearch)).then(function (parts) {
+        var merged = currentTaggedSearch();
+        parts.forEach(function (p) { merged = merged.concat(p); });
+        window.initSearch(merged, onSearchResult);
+        if (searchInput && searchInput.value.trim()) {
+          searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      });
+    } else {
+      window.initSearch(searchData || [], onSearchResult);
+      if (searchInput && searchInput.value.trim()) {
+        searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // URL state (R1): ?q=&cat=&from=&to=&sort=
+  // ------------------------------------------------------------------
+
+  function parseUrlState() {
+    var out = { q: "", cat: "", from: "", to: "", sort: "" };
+    try {
+      var p = new URLSearchParams(window.location.search);
+      if (p.has("q") && p.get("q")) out.q = p.get("q");
+      if (p.has("cat") && p.get("cat")) out.cat = p.get("cat");
+      var fromV = p.get("from") || "";
+      if (/^\d{4}-\d{2}-\d{2}$/.test(fromV)) out.from = fromV;
+      var toV = p.get("to") || "";
+      if (/^\d{4}-\d{2}-\d{2}$/.test(toV)) out.to = toV;
+      var s = p.get("sort") || "";
+      if (s === "date-asc" || s === "date-desc" || s === "images-desc") out.sort = s;
+    } catch (e) { /* ignore malformed query */ }
+    return out;
+  }
+
+  function syncUrlState(replace) {
+    if (!currentRoute) return;
+    var params = new URLSearchParams();
+    var q = searchInput ? searchInput.value.trim() : "";
+    if (q) params.set("q", q);
+    if (currentCategory) params.set("cat", currentCategory);
+    if (fromEl && fromEl.value) params.set("from", fromEl.value);
+    if (toEl && toEl.value) params.set("to", toEl.value);
+    if (sortEl && sortEl.value && sortEl.value !== "date-desc") params.set("sort", sortEl.value);
+    var qs = params.toString();
+    var url = routePath(currentRoute) + (qs ? "?" + qs : "");
+    var state = { route: routePath(currentRoute) };
+    try {
+      if (replace) history.replaceState(state, "", url);
+      else history.pushState(state, "", url);
+    } catch (e) { /* ignore quota errors */ }
+  }
+
+  function applyUrlState() {
+    var st = parseUrlState();
+    if (searchInput && st.q) {
+      searchInput.value = st.q;
+      var clearBtn = document.getElementById("searchClear");
+      if (clearBtn) clearBtn.hidden = false;
+    }
+    if (st.cat && document.querySelector('.filter-btn[data-cat="' + st.cat + '"]')) {
+      currentCategory = st.cat;
+      document.querySelectorAll(".filter-btn").forEach(function (btn) {
+        btn.classList.toggle("active", btn.dataset.cat === st.cat);
+      });
+    }
+    if (fromEl) fromEl.value = st.from;
+    if (toEl) toEl.value = st.to;
+    if (sortEl) sortEl.value = st.sort || "date-desc";
     if (searchInput && searchInput.value.trim()) {
       searchInput.dispatchEvent(new Event("input", { bubbles: true }));
     }
+  }
+
+  if (searchInput) {
+    searchInput.addEventListener("input", function () {
+      clearTimeout(urlSyncTimer);
+      urlSyncTimer = setTimeout(function () { syncUrlState(true); }, 300);
+    });
+    searchInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        clearTimeout(urlSyncTimer);
+        syncUrlState(false);
+      }
+    });
+  }
+
+  if (allSiteToggle) {
+    allSiteToggle.addEventListener("change", function () {
+      setupSearch();
+      syncUrlState(false);
+    });
   }
 
   // ------------------------------------------------------------------
@@ -750,11 +1219,26 @@
   updateFsThumb();
 
   var initial = parseRoute(window.location.pathname);
+  var toTarget = !initial && parseToTarget(window.location.pathname);
   if (initial) {
     currentRoute = initial;
     rememberRoute(initial);
     updateShell();
     loadRoute(initial);
+  } else if (toTarget) {
+    // /to/{account}/{slug}/ 或 /to/{slug}/：不 redirect，保留可分享 URL
+    var start;
+    if (toTarget.account) {
+      start = { account: toTarget.account, page: "main" };
+    } else {
+      var last = null;
+      try { last = localStorage.getItem(LS_LAST); } catch (e) { /* ignore */ }
+      start = last ? (parseRoute(last) || { account: "ak", page: "main" }) : { account: "ak", page: "main" };
+    }
+    currentRoute = start;
+    rememberRoute(start);
+    updateShell();
+    loadRoute(start);
   } else {
     // "/" or unknown → redirect to last route (default /ak/)
     redirectToLast();

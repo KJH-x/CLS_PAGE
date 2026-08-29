@@ -76,6 +76,10 @@ _LOCAL_ARCHIVE_DIR = os.environ.get(
     "LOCAL_ARCHIVE_DIR",
     str(pathlib.Path(__file__).resolve().parents[1] / "local_archive"),
 )
+# Publish original (uncompressed) bytes to R2 originals/ during collection.
+# Default OFF: the public bucket must not redistribute third-party artwork;
+# enable explicitly (e.g. a private bucket) via R2_UPLOAD_ORIGINALS=1.
+_R2_UPLOAD_ORIGINALS = os.environ.get("R2_UPLOAD_ORIGINALS", "") != ""
 
 DISPLAY_WIDTH_SCALE = 1  # no horizontal downsampling
 JPEG_QUALITY = 35
@@ -196,6 +200,37 @@ def r2_put_image(key: str, data: bytes) -> None:
         Key=key,
         Body=data,
         ContentType="image/jpeg",
+        CacheControl="public, max-age=31536000, immutable",
+    )
+
+
+_ORIGINAL_CONTENT_TYPES = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "png": "image/png",
+    "gif": "image/gif",
+}
+
+
+def _original_content_type(ext: str) -> str:
+    return _ORIGINAL_CONTENT_TYPES.get((ext or "").lower(), "application/octet-stream")
+
+
+def r2_put_original(key: str, data: bytes) -> None:
+    """Upload original bytes to R2 originals/ with format-aware ContentType.
+
+    Only ever called when R2_UPLOAD_ORIGINALS is enabled (default off)."""
+    if _DRY_RUN:
+        log(f"  DRY RUN: would upload {key} ({len(data):,} bytes)")
+        return
+    s3 = _get_s3()
+    ext = key.rsplit(".", 1)[-1] if "." in key else ""
+    s3.put_object(
+        Bucket=_R2_BUCKET,
+        Key=key,
+        Body=data,
+        ContentType=_original_content_type(ext),
         CacheControl="public, max-age=31536000, immutable",
     )
 
@@ -481,6 +516,34 @@ def archived_image_inputs(images: list[dict]) -> list[dict]:
     ]
 
 
+def ensure_small_thumb_keys(images: list[dict]) -> list[dict]:
+    """Guarantee every image object carries a smallThumbKey key.
+
+    Older index entries may be sparse (missing the key entirely). Setting an
+    empty-string default keeps the key present in every written index.json so
+    the front-end fallback chain (smallThumbKey || thumbnailKey || r2Key) is
+    unambiguous. Idempotent: existing non-empty values are preserved.
+    """
+    for img in images:
+        img.setdefault("smallThumbKey", "")
+    return images
+
+
+def sha256_hex(data: bytes) -> str:
+    """Hex digest of raw bytes (computed before any compression)."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def detect_image_ext(raw: bytes) -> str:
+    """Best-effort original extension from the decoded image format."""
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            fmt = (im.format or "").lower()
+        return {"jpeg": "jpg", "webp": "webp", "png": "png", "gif": "gif"}.get(fmt, "img")
+    except Exception:
+        return "img"
+
+
 def extract_dynamic(item: dict) -> Optional[dict]:
     """Convert a raw Bilibili dynamic item into our internal format.
     Returns None if the dynamic has no usable images or doesn't match filters."""
@@ -635,6 +698,94 @@ def _cls_title(search_text: str, category: str) -> str:
     if not title:
         title = "(no title)"
     return title
+
+
+# ---------------------------------------------------------------------------
+# Stable shareable slug (server-authoritative, mirrored by client buildSlug)
+# ---------------------------------------------------------------------------
+
+def _normalize_slug(source: str) -> str:
+    """Client-mirrored normalization: first non-empty line after #tag# strip,
+    whitespace collapse, then any char outside [A-Za-z0-9_\\u4e00-\\u9fa5-] -> '-'.
+
+    The safe class is deliberately ASCII-only: JS `\\w` is ASCII-only while
+    Python `\\w` is unicode-aware, so an explicit class keeps both sides
+    byte-identical for the same input."""
+    line = ""
+    for raw in (source or "").split("\n"):
+        cleaned = re.sub(r"#[^#]+#", "", raw).strip()
+        if cleaned:
+            line = cleaned
+            break
+    line = re.sub(r"\s+", " ", line).strip()
+    line = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fa5-]", "-", line)
+    line = re.sub(r"-+", "-", line).strip("-")
+    return line
+
+
+def server_slug(text: str, full_text: str, dyn_id: str) -> str:
+    """Stable shareable slug, mirrored 1:1 by the client buildSlug() (app.js).
+
+    Order:
+      1. fence 〓…〓 (ak):  [｜|]([^〓▼]+)〓  ->  "7周年庆典"
+      2. fence ▼…▼ (ef):   ▼(.+?)▼          ->  "相伴庆典开幕！"
+      3. normalized first line of text/fullText
+      4. fallback: dyn id
+    The value is frozen into index.json so already-shared links stay valid
+    even if upstream text or future derivation rules change."""
+    source = ((text or "").strip() or (full_text or "").strip() or "")
+    m = re.search(r"[｜|]([^〓▼]+)〓", source)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    m = re.search(r"▼(.+?)▼", source)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    norm = _normalize_slug(source)
+    if norm:
+        return norm
+    return str(dyn_id or "")
+
+
+def make_dyn_entry(dyn: dict, images: list[dict]) -> dict:
+    """Build the persisted index entry for one dynamic.
+
+    Hoisted from main() so it is importable and testable; behavior identical
+    to the original inline dict construction plus the server-authoritative
+    `slug` field."""
+    return {
+        "id": dyn["id"],
+        "timestamp": dyn["timestamp"],
+        "date": dyn["date"],
+        "text": dyn["text"],
+        "fullText": dyn.get("fullText", ""),
+        "bilibiliUrl": dyn["bilibiliUrl"],
+        "tags": dyn["tags"],
+        "category": dyn.get("category", ""),
+        "imageCount": len(images),
+        "slug": server_slug(dyn.get("text", ""), dyn.get("fullText", ""), dyn.get("id", "")),
+        "images": images,
+    }
+
+
+def build_search_index(dynamics: list[dict]) -> list[dict]:
+    """Search index entries, extended with fullText/timestamp/bilibiliUrl.
+
+    Old merged entries may lack fullText, so every optional key is read with
+    .get() and defaults to ""/0."""
+    return [
+        {
+            "dynamicId": d["id"],
+            "text": d["text"],
+            "date": d["date"],
+            "tags": d["tags"],
+            "category": d.get("category", ""),
+            "imageCount": d["imageCount"],
+            "fullText": (d.get("fullText") or "")[:200],
+            "timestamp": d.get("timestamp", 0),
+            "bilibiliUrl": d.get("bilibiliUrl", ""),
+        }
+        for d in dynamics
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +952,7 @@ def main() -> None:
     log(f"  R2 bucket  : {_R2_BUCKET}")
     log(f"  Prefix     : {_OUTPUT_PREFIX or '(production)'}")
     log(f"  Dry run    : {_DRY_RUN}")
+    log(f"  Publish originals: {'ON (R2_UPLOAD_ORIGINALS)' if _R2_UPLOAD_ORIGINALS else 'OFF (private by default)'}")
     log("=" * 60)
 
     # ---- 0. Check R2 state ---------------------------------------------------
@@ -950,7 +1102,7 @@ def main() -> None:
             api_h = img_info.get("height", 0)
             r2_key = img_info.get("r2Key") or _pk(f"images/{dyn['id']}/{idx}.jpg")
 
-            # Skip square images (e.g. 500x500 icons) and banners (aspect > 0.3)
+            # Skip square images (e.g. 500x500 icons) and banners (aspect >= 0.3)
             if api_w > 0 and api_h > 0:
                 if api_w == api_h:
                     log(f"  [{dyn['id'][:16]}] img {idx} — square ({api_w}x{api_h}), skipped")
@@ -989,6 +1141,10 @@ def main() -> None:
                     "storedHeight": old_meta.get("storedHeight", 0),
                     "displayWidthScale": old_meta.get("displayWidthScale", DISPLAY_WIDTH_SCALE),
                     "compressionMode": old_meta.get("compressionMode", "original-q35"),
+                    "sha256": old_meta.get("sha256", ""),
+                    "originalSize": old_meta.get("originalSize", 0),
+                    "originalExt": old_meta.get("originalExt", ""),
+                    "originalKey": old_meta.get("originalKey", ""),
                 }
                 images.append(meta)
                 tracked_objects.add(r2_key)
@@ -1050,6 +1206,7 @@ def main() -> None:
                         r2_put_image(small_key, small_data)
                         small_exists = True
                         log(f"    Small thumb backfilled")
+                old_meta_r = old_images_map.get(r2_key, {})
                 meta = {
                     "index": idx,
                     "r2Key": r2_key,
@@ -1061,6 +1218,10 @@ def main() -> None:
                     "storedHeight": stored_h,
                     "displayWidthScale": DISPLAY_WIDTH_SCALE,
                     "compressionMode": "recovered-from-r2",
+                    "sha256": old_meta_r.get("sha256", ""),
+                    "originalSize": old_meta_r.get("originalSize", 0),
+                    "originalExt": old_meta_r.get("originalExt", ""),
+                    "originalKey": old_meta_r.get("originalKey", ""),
                 }
                 images.append(meta)
                 tracked_objects.add(r2_key)
@@ -1085,11 +1246,23 @@ def main() -> None:
             compressed, meta = result
             meta["index"] = idx
             meta["r2Key"] = r2_key
+            meta["sha256"] = sha256_hex(raw)
+            meta["originalSize"] = len(raw)
+            meta["originalExt"] = detect_image_ext(raw)
 
             # Local archive: compressed copy + original cache (hash + dynamic id)
             if not _DRY_RUN:
                 local_save_compressed(dyn["id"], idx, compressed)
                 local_save_original(dyn["id"], idx, raw)
+
+            # Optional: publish original bytes to R2 originals/ (default OFF —
+            # public bucket must not redistribute copyrighted originals).
+            if _R2_UPLOAD_ORIGINALS:
+                orig_key = _pk(f"originals/{dyn['id']}/{idx}.{meta['originalExt']}")
+                r2_put_original(orig_key, raw)
+                meta["originalKey"] = orig_key
+                tracked_objects.add(orig_key)
+                log(f"    Original: {orig_key}")
 
             # Generate and upload thumbnail
             thumb_key = _pk(f"thumbs/{dyn['id']}/{idx}.jpg")
@@ -1131,18 +1304,11 @@ def main() -> None:
         for new_idx, img in enumerate(images):
             img["index"] = new_idx
 
-        dyn_entry = {
-            "id": dyn["id"],
-            "timestamp": dyn["timestamp"],
-            "date": dyn["date"],
-            "text": dyn["text"],
-            "fullText": dyn["fullText"],
-            "bilibiliUrl": dyn["bilibiliUrl"],
-            "tags": dyn["tags"],
-            "category": dyn.get("category", ""),
-            "imageCount": len(images),
-            "images": images,
-        }
+        # Guarantee smallThumbKey key exists on every image (older entries may
+        # be sparse); empty string triggers the front-end fallback chain.
+        ensure_small_thumb_keys(images)
+
+        dyn_entry = make_dyn_entry(dyn, images)
         dynamics_data.append(dyn_entry)
 
     log(f"  Image summary: {stats_new} new, {stats_recovered} recovered, {stats_fail} failed")
@@ -1204,19 +1370,8 @@ def main() -> None:
         "dynamics": figure_dynamics,
     }
 
-    def build_search_index(dynamics: list[dict]) -> list[dict]:
-        return [
-            {
-                "dynamicId": d["id"],
-                "text": d["text"],
-                "date": d["date"],
-                "tags": d["tags"],
-                "category": d.get("category", ""),
-                "imageCount": d["imageCount"],
-            }
-            for d in dynamics
-        ]
-
+    # build_search_index is module-level (see top-level definition) so it is
+    # importable and testable; the old nested copy has been removed.
     search_index = build_search_index(main_dynamics)
     figures_search_index = build_search_index(figure_dynamics)
 

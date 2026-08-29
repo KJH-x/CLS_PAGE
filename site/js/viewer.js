@@ -11,6 +11,11 @@
   var thumbStrip = document.getElementById("lbThumbStrip");
   var tipEl = document.getElementById("lbTip");
   var zoomBadge = document.getElementById("lbZoomBadge");
+  var infoEl = document.getElementById("lbInfo");
+  var infoTitle = document.getElementById("lbInfoTitle");
+  var infoSize = document.getElementById("lbInfoSize");
+  var infoOriginal = document.getElementById("lbInfoOriginal");
+  var copyBtn = document.getElementById("lbInfoCopy");
   var backgroundElements = document.querySelectorAll(
     ".site-header, .search-bar, .filter-bar, .main-content, .site-footer"
   );
@@ -18,6 +23,7 @@
   // --- State ---
   var images = [];
   var currentIdx = 0;
+  var currentDyn = null;    // current dynamic metadata (info bar / copy link)
 
   // Zoom / pan
   var zoom = 1;
@@ -211,9 +217,20 @@
     highlightThumbnail();
     scrollThumbIntoView();
 
-    // Preload adjacent
-    preload(currentIdx - 1);
-    preload(currentIdx + 1);
+    // Info bar refresh (per-image dimensions)
+    updateInfoBar();
+
+    // Lazy preload: 当前图加载完成后才预取下一张全图；
+    // 不再在开灯箱时并发拉取整条动态的全图。
+    var nextIdx = currentIdx + 1;
+    function scheduleNextPreload() {
+      preload(nextIdx);
+      img.removeEventListener("load", scheduleNextPreload);
+      img.removeEventListener("error", scheduleNextPreload);
+    }
+    img.addEventListener("load", scheduleNextPreload);
+    img.addEventListener("error", scheduleNextPreload); // 当前图失败也不卡住下一张预取
+    if (img.complete) scheduleNextPreload();            // 命中缓存时立即调度
   }
 
   function preload(idx) {
@@ -243,7 +260,8 @@
       thumb.title = (i + 1) + " / " + images.length;
 
       var tImg = document.createElement("img");
-      tImg.src = baseUrl + "/" + (meta.r2Key || "");
+      // 缩略条只拉 1/8 小图；缺 smallThumbKey 的旧条目回退 thumbnailKey → r2Key
+      tImg.src = baseUrl + "/" + (meta.smallThumbKey || meta.thumbnailKey || meta.r2Key || "");
       tImg.alt = "";
       tImg.loading = "lazy";
       tImg.decoding = "async";
@@ -271,12 +289,68 @@
     if (active) active.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
   }
 
+  // --- Info bar ---
+
+  function updateInfoBar() {
+    if (!infoEl) return;
+    if (!currentDyn) { infoEl.hidden = true; return; }
+
+    var meta = images[currentIdx] || {};
+    var ow = meta.originalWidth || meta.storedWidth || 0;
+    var oh = meta.originalHeight || meta.storedHeight || 0;
+
+    infoTitle.textContent = currentDyn.text || "(无标题)";
+    infoTitle.title = currentDyn.fullText || currentDyn.text || "";
+    infoSize.textContent = (ow > 0 && oh > 0) ? ow + " × " + oh + " px" : "";
+    infoOriginal.hidden = !currentDyn.bilibiliUrl;
+    if (currentDyn.bilibiliUrl) infoOriginal.href = currentDyn.bilibiliUrl;
+    copyBtn.hidden = !currentDyn;
+
+    infoEl.hidden = false;
+  }
+
+  // wave-1 本地链接构造：优先 Rank 2 的 window.buildDynamicLink；否则用 〓/▼ 栅栏 + 归一化回退
+  function viewerLink(dyn) {
+    if (typeof window.buildDynamicLink === "function") return window.buildDynamicLink(dyn);
+    var text = dyn.text || dyn.fullText || "";
+    var m = text.match(/[｜|](.+?)〓/) || text.match(/▼(.+?)▼/);
+    var slug = m ? m[1].trim() : (text.split("\n")[0] || "").replace(/#[^#]+#/g, "").trim();
+    slug = slug.replace(/\s+/g, " ").replace(/[^\w\u4e00-\u9fa5-]/g, "-") || dyn.id;
+    var account = document.body.getAttribute("data-account") || "ak";  // app.js:141 已设
+    return location.origin + "/to/" + account + "/" + encodeURIComponent(slug) + "/";
+  }
+
+  // wave-1 本地复制实现：clipboard API → execCommand 兜底 → prompt 手动复制
+  function copyLinkFallback(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) { /* fall through */ }
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) {
+      window.prompt("复制失败，请手动复制链接", text);
+      return true;
+    }
+  }
+
   // --- Show / Hide ---
 
-  function show(imgs, idx) {
+  function show(imgs, idx, dyn) {
     if (!imgs || imgs.length === 0) return;
     previousFocus = document.activeElement;
     images = imgs;
+    currentDyn = dyn || null;   // 旧调用方仍传 2 参时安全降级
     currentIdx = Math.max(0, Math.min(images.length - 1, Number(idx) || 0));
     zoom = 1; tx = 0; ty = 0;
     overlay.hidden = false;
@@ -294,6 +368,8 @@
     document.body.style.overflow = "";
     images = [];
     currentIdx = 0;
+    currentDyn = null;
+    if (infoEl) infoEl.hidden = true;
     zoom = 1; tx = 0; ty = 0;
     stage.innerHTML = "";
     thumbStrip.innerHTML = "";
@@ -331,6 +407,25 @@
   closeBtn.addEventListener("click", hide);
   prevBtn.addEventListener("click", prev);
   nextBtn.addEventListener("click", next);
+
+  // --- Info bar copy button ---
+  copyBtn.addEventListener("click", function () {
+    if (!currentDyn) return;
+    var url = viewerLink(currentDyn);
+    if (!url) return;
+    var ok = false;
+    if (typeof window.copyText === "function") {   // Rank 2 就绪后优先走共享实现
+      window.copyText(url);
+      ok = true;
+    } else {
+      ok = copyLinkFallback(url);                   // wave-1 本地回退
+    }
+    if (ok) {
+      copyBtn.textContent = "已复制 ✓";
+      clearTimeout(copyBtn._t);
+      copyBtn._t = setTimeout(function () { copyBtn.textContent = "复制链接"; }, 1500);
+    }
+  });
 
   // --- Overlay click (backdrop) ---
   overlay.addEventListener("click", function (e) {

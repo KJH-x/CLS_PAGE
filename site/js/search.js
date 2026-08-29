@@ -15,6 +15,16 @@
     onFilterCallback = filterFn;
   };
 
+  function scoreMatch(item, token) {
+    let score = 0;
+    if (item.text && item.text.toLowerCase().includes(token)) score += 3;
+    if (item.tags && item.tags.some(function (t) { return t.toLowerCase().includes(token); })) score += 2;
+    if (item.fullText && item.fullText.toLowerCase().includes(token)) score += 1;
+    if (item.date && item.date.includes(token)) score += 0.5;
+    if (item.dynamicId && item.dynamicId.includes(token)) score += 0.5;
+    return score;
+  }
+
   function doSearch() {
     const query = input.value.trim().toLowerCase();
     if (!query) {
@@ -34,18 +44,39 @@
     }
 
     const tokens = query.split(/\s+/).filter(Boolean);
-    const matched = searchIndex.filter(function (item) {
-      return tokens.every(function (token) {
-        if (item.text && item.text.toLowerCase().includes(token)) return true;
-        if (item.date && item.date.includes(token)) return true;
-        if (item.tags && item.tags.some(function (t) { return t.toLowerCase().includes(token); })) return true;
-        if (item.dynamicId && item.dynamicId.includes(token)) return true;
-        return false;
-      });
+    const scored = searchIndex.map(function (item) {
+      let s = 0;
+      tokens.forEach(function (tok) { s += scoreMatch(item, tok); });
+      return { item: item, score: s };
     });
+    const matched = scored
+      .filter(function (e) { return e.score > 0; })
+      .sort(function (a, b) { return b.score - a.score; })
+      .map(function (e) { return e.item; });
 
     const ids = new Set(matched.map(function (m) { return m.dynamicId; }));
-    statusEl.textContent = matched.length + " / " + searchIndex.length + " 条";
+
+    let statusText = matched.length + " / " + searchIndex.length + " 条";
+    const accountCounts = {};
+    let anyAccount = false;
+    matched.forEach(function (m) {
+      if (m._account) {
+        anyAccount = true;
+        accountCounts[m._account] = (accountCounts[m._account] || 0) + 1;
+      }
+    });
+    if (anyAccount) {
+      const parts = Object.keys(accountCounts).map(function (a) { return a + " " + accountCounts[a]; });
+      statusText += "（" + parts.join(" · ") + "）";
+    }
+    if (matched.length === 0) {
+      const hasFullText = searchIndex.some(function (m) {
+        return !!(m.fullText && String(m.fullText).length);
+      });
+      if (!hasFullText) statusText += " · 当前索引不含正文";
+    }
+
+    statusEl.textContent = statusText;
     noResults.hidden = matched.length > 0;
 
     if (onFilterCallback) onFilterCallback(ids);
