@@ -223,6 +223,37 @@ class CollectTests(unittest.TestCase):
         self.assertIsNotNone(dynamic)
         self.assertEqual(dynamic["category"], "上新")
 
+    def test_extract_dynamic_collab_shangxin_no_cls_prefix_and_none_title(self):
+        item = {
+            "id_str": "1245176397131939889",
+            "modules": {
+                "module_author": {"pub_ts": "1788732000"},
+                "module_dynamic": {
+                    "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                            "title": None,
+                            "summary": {
+                                "text": (
+                                    "互动抽奖 〓明日方舟 × 女神异闻录3 Reload｜月行水上〓上新\n"
+                                    "博士们好，明日方舟 × 女神异闻录3 Reload 联动周边即将开启预售"
+                                )
+                            },
+                            "pics": [
+                                {"url": "https://example.test/a.jpg", "width": 100, "height": 500}
+                            ],
+                        },
+                    }
+                },
+            },
+        }
+
+        dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "上新")
+        self.assertIn("月行水上", dynamic["text"])
+
     def test_archive_date_accepts_historic_string_timestamp(self):
         self.assertEqual(collect.coerce_timestamp("1767225600"), 1767225600)
         self.assertEqual(collect.format_archive_date("1767225600"), "2026-01-01")

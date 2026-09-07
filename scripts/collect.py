@@ -460,8 +460,10 @@ def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[
 
 _TAG_RE = re.compile(r"#(\S+?)#")
 
-# Only match dynamics with title pattern: 〓朝陇山{date}｜{name}〓上新
-_TITLE_PATTERN = re.compile(r"〓朝陇山\s*\d{1,2}\s*[A-Z][a-z]+\.?\s*[｜|].*〓(上新|余量上架|复刻上新)")
+# Match fenced sale titles: 〓....｜name〓(上新|余量上架|复刻上新)
+# (collab/product titles like "〓明日方舟 × 女神异闻录3 Reload｜月行水上〓上新"
+#  have no 朝陇山+date prefix, so match any fenced name with a ｜ separator)
+_TITLE_PATTERN = re.compile(r"〓[^〓\n]*[｜|][^〓\n]*〓(上新|余量上架|复刻上新)")
 
 # 贩售情报 announcements (e.g. 〓明日方舟×... 现场&线上 贩售情报公开！) are archived under 上新
 SALES_INFO_RE = re.compile(r".*贩售情报.*")
@@ -608,7 +610,7 @@ def extract_dynamic(item: dict) -> Optional[dict]:
                 image_urls.append({"url": url, "width": pic.get("width", 0), "height": pic.get("height", 0)})
         # Text lives in summary.text; fallback to title
         summary = opus.get("summary") or {}
-        search_text = (opus.get("title", "") + " " + summary.get("text", "")).strip()
+        search_text = ((opus.get("title") or "") + " " + summary.get("text", "")).strip()
 
     if not image_urls:
         if _EXTRACT_DEBUG:
