@@ -63,6 +63,7 @@ _ARCHIVE_MODE = os.environ.get("ARCHIVE_MODE", "cls").strip().lower()
 _KEEP_RECENT = _env_int("KEEP_RECENT", "10")
 _OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "")
 _DRY_RUN = os.environ.get("DRY_RUN", "") != ""
+_EXTRACT_DEBUG = os.environ.get("EXTRACT_DEBUG", "") != ""
 _MIN_DEDUP = _env_int("EXPECTED_MIN_DEDUP_DYNAMICS", "0")
 _MIN_SURVIVED = _env_int("EXPECTED_MIN_SURVIVED_DYNAMICS", "0")
 _MAX_ALL_SKIPPED = _env_int("EXPECTED_MAX_ALL_IMAGE_SKIPPED", "999")
@@ -544,10 +545,30 @@ def detect_image_ext(raw: bytes) -> str:
         return "img"
 
 
+def _debug_item(item: dict, msg: str) -> None:
+    """EXTRACT_DEBUG helper: print one line per raw dynamic with identifying info."""
+    modules = item.get("modules") or {}
+    mod_dyn = modules.get("module_dynamic") or {}
+    mod_auth = modules.get("module_author") or {}
+    dyn_id = item.get("id_str", "")
+    pub = mod_auth.get("pub_time", "") or ""
+    major = (mod_dyn.get("major") or {}).get("type", "")
+    if _ARCHIVE_MODE == "endfield":
+        text = (mod_dyn.get("opus", {}) or {}).get("summary", {}) or {}
+        snippet = _fence_line(text.get("text", ""))[:50]
+    else:
+        snippet = ""
+    log(f"  [extract] {dyn_id} major={major} pub={pub} {msg}" + (f" title={snippet!r}" if snippet else ""))
+
+
 def extract_dynamic(item: dict) -> Optional[dict]:
     """Convert a raw Bilibili dynamic item into our internal format.
     Returns None if the dynamic has no usable images or doesn't match filters."""
+    if _EXTRACT_DEBUG:
+        _debug_item(item, "start")
     if item.get("orig"):
+        if _EXTRACT_DEBUG:
+            _debug_item(item, "skip: forward/repost")
         return None
 
     modules = item.get("modules") or {}
@@ -556,16 +577,20 @@ def extract_dynamic(item: dict) -> Optional[dict]:
 
     dyn_id = item.get("id_str", "")
     if not dyn_id:
+        if _EXTRACT_DEBUG:
+            _debug_item(item, "skip: no id_str")
         return None
 
     pub_ts = coerce_timestamp(mod_auth.get("pub_ts", 0))
     if pub_ts <= 0:
+        if _EXTRACT_DEBUG:
+            _debug_item(item, f"skip: no pub_ts (id={dyn_id})")
         return None
 
     major = mod_dyn.get("major") or {}
     major_type = major.get("type", "")
 
-    image_urls: list[str] = []
+    image_urls: list[dict] = []
     search_text = ""
 
     if major_type == "MAJOR_TYPE_DRAW":
@@ -586,6 +611,8 @@ def extract_dynamic(item: dict) -> Optional[dict]:
         search_text = (opus.get("title", "") + " " + summary.get("text", "")).strip()
 
     if not image_urls:
+        if _EXTRACT_DEBUG:
+            _debug_item(item, f"skip: no images (major={major_type}, id={dyn_id})")
         return None
 
     # Category detection — per-archive mode:
@@ -594,14 +621,20 @@ def extract_dynamic(item: dict) -> Optional[dict]:
     if _ARCHIVE_MODE == "endfield":
         category, title = _endfield_categorize(search_text)
         if category is None:
+            if _EXTRACT_DEBUG:
+                _debug_item(item, f"skip: endfield categorize=None (id={dyn_id}, title={title[:50]!r})")
             return None
     else:
         category = _cls_categorize(search_text)
         if category is None:
+            if _EXTRACT_DEBUG:
+                _debug_item(item, f"skip: cls categorize=None (id={dyn_id}, text={first_text_line(search_text)[:60]!r})")
             return None
         title = _cls_title(search_text, category)
 
     tags = extract_tags(search_text)
+    if _EXTRACT_DEBUG:
+        _debug_item(item, f"ACCEPT category={category} title={title[:60]!r} imgs={len(image_urls)} (id={dyn_id})")
 
     return {
         "id": dyn_id,
@@ -663,9 +696,10 @@ def _cls_categorize(search_text: str) -> Optional[str]:
     title_match = _TITLE_PATTERN.search(search_text)
     if title_match:
         return title_match.group(1)
-    if SALES_INFO_RE.search(first_text_line(search_text)):
+    title_line = _fence_line(search_text)
+    if SALES_INFO_RE.search(title_line):
         return "上新"
-    if FIGURE_PREORDER_RE.search(first_text_line(search_text)):
+    if FIGURE_PREORDER_RE.search(title_line):
         return FIGURE_PREORDER_CATEGORY
     if "余量上架" in search_text.replace("#", ""):
         return "余量上架"
@@ -1018,10 +1052,15 @@ def main() -> None:
     # ---- 3. Extract candidates -----------------------------------------------
     log("[Step 3] Extracting dynamics with images...")
     candidates: list[dict] = []
+    rejected = 0
     for item in raw_items:
         info = extract_dynamic(item)
         if info:
             candidates.append(info)
+        else:
+            rejected += 1
+    if _EXTRACT_DEBUG:
+        log(f"  Extract summary: {len(candidates)} accepted, {rejected} rejected (of {len(raw_items)} raw)")
 
     candidates.sort(key=lambda d: d["timestamp"])  # oldest first for dedup
     _ACTIVITY_RE = re.compile(r"[｜|](.+?)〓")

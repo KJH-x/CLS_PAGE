@@ -70,6 +70,38 @@ class CollectTests(unittest.TestCase):
         self.assertIsNotNone(dynamic)
         self.assertEqual(dynamic["date"], "2026-01-01")
 
+    def test_extract_dynamic_figure_preorder_title_on_second_line(self):
+        item = {
+            "id_str": "1238125686493806611",
+            "modules": {
+                "module_author": {"pub_ts": "1784476800"},
+                "module_dynamic": {
+                    "major": {
+                        "type": "MAJOR_TYPE_OPUS",
+                        "opus": {
+                            "title": "",
+                            "summary": {
+                                "text": (
+                                    "明日方舟# #ALTER#\n"
+                                    "〓明日方舟 1/7手办 伊内丝 庆典之夜VER. 预售开启!〓\n"
+                                    "商品名称：明日方舟 1/7手办 伊内丝 庆典之夜VER. 官方定价：950元"
+                                )
+                            },
+                            "pics": [
+                                {"url": "https://example.test/a.jpg", "width": 100, "height": 500}
+                            ],
+                        },
+                    }
+                },
+            },
+        }
+
+        dynamic = collect.extract_dynamic(item)
+
+        self.assertIsNotNone(dynamic)
+        self.assertEqual(dynamic["category"], "手办")
+        self.assertIn("伊内丝", dynamic["text"])
+
     def test_extract_dynamic_sales_info_archived_under_shangxin(self):
         item = {
             "id_str": "1221797962460430352",
