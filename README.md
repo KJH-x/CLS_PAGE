@@ -133,6 +133,7 @@ pip install -r scripts/requirements.txt
 | `KEEP_RECENT` | Max dynamics to keep in index (default 10) |
 | `OUTPUT_PREFIX` | Optional isolated R2 namespace for staging runs (e.g. `endfield`) |
 | `DRY_RUN` | If non-empty, perform reads/downloads but skip every R2 write |
+| `EXTRACT_DEBUG` | If non-empty, log per-item extraction decisions (accept / reject reason) plus an accept/reject summary during Step 3 — useful to see why a dynamic was or wasn't archived |
 | `ALLOW_IMAGE_FAILURES` | Maximum tolerated image failures before aborting (default 0) |
 | `REQUEST_MAX_ATTEMPTS` | Attempts for transient API/image failures (default 3) |
 | `BACKOFF_BASE_SECONDS` | Base delay for exponential retry backoff (default 1) |
