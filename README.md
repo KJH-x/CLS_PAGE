@@ -17,7 +17,25 @@ Cloudflare Pages + Cloudflare R2. No Workers.
 - **Mobile reading mode** — vertical scroll with touch-friendly zoom
 - **Search** — filter by title, tag, or date (per-account search index)
 - **Dark theme** — auto / manual toggle
-- **SPA routing** — direct-link to a dynamic via `/to/{code}/` (short code: last 8 base36 chars of the Bilibili dynamic ID, collision space 36^8 ≈ 2.8e12), or `#id-{id}`; legacy `/to/{account}/{activity-slug}/` links still resolve
+- **SPA routing** — direct-link to a dynamic via `/to/{code}/` (variable-length share code, see below), or `#id-{id}`; legacy `/to/{account}/{activity-slug}/` links still resolve
+
+### Share Codes (variable-length, UTF-8 style)
+
+Collect.py freezes a `code` field into each index entry; the copy link emits `/to/{code}/`.
+
+- **4-char default**: uniform `sha256(account:id)` candidate inside a per-account first-char pool (ak `0-9a-h`, ef `i-z`; 18×36³ = 839,808 each, disjoint pools make cross-account collisions impossible)
+- **8-char escape**: IDs claim candidates in ascending order; a later collision escapes to its own 8-char base36 tail. The rule is a pure function of the append-only ID set, so assigned codes are never reassigned and shared links stay valid
+- **Resolution chain**: server `code` → server `slug` → client-derived slug → tail-8 → raw ID
+- **Collision model** (sequential draws without replacement, P(k+1-th draw collides) = k/839,808):
+  observed posting rates ak ≈ 46/yr (n₀=43), ef ≈ 32/yr (n₀=20); 63 codes measured, zero collisions.
+  | Horizon | ak | ef | combined |
+  |---|---|---|---|
+  | 1 year | 0.36% | 0.14% | **≈0.5% (1/200)** |
+  | 5 years | 4.2% | 1.9% | 6.0% |
+  | 10 years | 13.9% | 6.6% | 19.6% |
+  | 50% point | ~22.6 yr (n≈1080) | ~33 yr (n≈1080) | — |
+
+  Escapes are soft: only the newer dynamic moves to 8 chars; existing 4-char codes and already-shared links are unaffected.
 - **Lazy small thumbs** — grid loads 1/8 `smthumbs/`, full image only on lightbox open
 - **Chinese localization** — full ZH-CN UI
 
