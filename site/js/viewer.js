@@ -309,15 +309,12 @@
     infoEl.hidden = false;
   }
 
-  // wave-1 本地链接构造：优先 Rank 2 的 window.buildDynamicLink；否则用 〓/▼ 栅栏 + 归一化回退
+  // wave-1 本地链接构造：优先 Rank 2 的 window.buildDynamicLink；否则用末 8 位 base36 短码
   function viewerLink(dyn) {
     if (typeof window.buildDynamicLink === "function") return window.buildDynamicLink(dyn);
-    var text = dyn.text || dyn.fullText || "";
-    var m = text.match(/[｜|](.+?)〓/) || text.match(/▼(.+?)▼/);
-    var slug = m ? m[1].trim() : (text.split("\n")[0] || "").replace(/#[^#]+#/g, "").trim();
-    slug = slug.replace(/\s+/g, " ").replace(/[^\w\u4e00-\u9fa5-]/g, "-") || dyn.id;
-    var account = document.body.getAttribute("data-account") || "ak";  // app.js:141 已设
-    return location.origin + "/to/" + account + "/" + encodeURIComponent(slug) + "/";
+    var code = "";
+    try { code = BigInt(dyn.id).toString(36).slice(-8); } catch (e) { code = String(dyn.id || ""); }
+    return location.origin + "/to/" + code + "/";
   }
 
   // wave-1 本地复制实现：clipboard API → execCommand 兜底 → prompt 手动复制

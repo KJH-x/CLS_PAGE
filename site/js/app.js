@@ -426,11 +426,15 @@
     return String((dyn && dyn.id) || "");
   }
 
+  function shortCode(id) {
+    // /to/{code}/ 短链：bilibili 雪花 ID 的 base36 末 8 位（≈ ID mod 36^8，
+    // 双射子集空间 2.8e12；63 条实测零碰撞，生日碰撞概率 ~7e-10）。
+    try { return BigInt(id).toString(36).slice(-8); }
+    catch (err) { return String(id || ""); }
+  }
+
   function buildDynamicLink(dyn) {
-    var account = (dyn && dyn._account) || (currentRoute && currentRoute.account) || "ak";
-    var slug = buildSlug(dyn);
-    if (!slug) return null;
-    return window.location.origin + "/to/" + account + "/" + encodeURIComponent(slug) + "/";
+    return window.location.origin + "/to/" + shortCode((dyn && dyn.id) || "") + "/";
   }
 
   function copyTextFallback(text) {
@@ -478,7 +482,9 @@
     if (target.id) return dyn.id === target.id;
     if (target.slug) {
       if (dyn.slug && dyn.slug === target.slug) return true;  // 服务端权威值直接比对
-      return buildSlug(dyn) === target.slug;                  // 旧索引回退：客户端推导
+      if (buildSlug(dyn) === target.slug) return true;        // 旧索引回退：客户端推导
+      if (shortCode(dyn.id) === target.slug) return true;     // /to/{短码}/
+      return dyn.id === target.slug;                          // 兜底：完整动态 ID
     }
     return false;
   }

@@ -17,7 +17,7 @@ Cloudflare Pages + Cloudflare R2. No Workers.
 - **Mobile reading mode** — vertical scroll with touch-friendly zoom
 - **Search** — filter by title, tag, or date (per-account search index)
 - **Dark theme** — auto / manual toggle
-- **SPA routing** — direct-link to a dynamic via `/to/{activity-slug}/` or `#id-{id}`
+- **SPA routing** — direct-link to a dynamic via `/to/{code}/` (short code: last 8 base36 chars of the Bilibili dynamic ID, collision space 36^8 ≈ 2.8e12), or `#id-{id}`; legacy `/to/{account}/{activity-slug}/` links still resolve
 - **Lazy small thumbs** — grid loads 1/8 `smthumbs/`, full image only on lightbox open
 - **Chinese localization** — full ZH-CN UI
 
