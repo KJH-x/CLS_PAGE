@@ -425,6 +425,75 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(newest, "newest")
         self.assertFalse(complete)
 
+    def test_pinned_cursor_does_not_stop_incremental_fetch(self):
+        payload = {
+            "code": 0,
+            "data": {
+                "items": [
+                    {
+                        "id_str": "1245176397131939889",
+                        "modules": {"module_tag": {"text": "置顶"}},
+                    },
+                    {"id_str": "1248144986178846728", "modules": {}},
+                    {"id_str": "1248160448094666754", "modules": {}},
+                ],
+                "has_more": False,
+                "offset": "",
+            },
+        }
+        with mock.patch.object(
+            collect, "_request_with_retry", return_value=FakeResponse(payload=payload)
+        ):
+            items, newest, complete = collect.fetch_dynamics("1245176397131939889")
+
+        self.assertTrue(complete)
+        ids = [item["id_str"] for item in items]
+        self.assertNotIn("1245176397131939889", ids)
+        self.assertIn("1248144986178846728", ids)
+        self.assertIn("1248160448094666754", ids)
+        self.assertEqual(newest, "1248144986178846728")
+
+    def test_unpinned_cursor_still_stops_incremental_fetch(self):
+        payload = {
+            "code": 0,
+            "data": {
+                "items": [
+                    {"id_str": "1248144986178846728", "modules": {}},
+                    {"id_str": "1245176397131939889", "modules": {}},
+                ],
+                "has_more": True,
+                "offset": "next",
+            },
+        }
+        with mock.patch.object(
+            collect, "_request_with_retry", return_value=FakeResponse(payload=payload)
+        ):
+            items, newest, complete = collect.fetch_dynamics("1245176397131939889")
+
+        self.assertTrue(complete)
+        self.assertEqual([item["id_str"] for item in items], ["1248144986178846728"])
+
+    def test_older_dynamic_stops_incremental_fetch_without_exact_match(self):
+        payload = {
+            "code": 0,
+            "data": {
+                "items": [
+                    {"id_str": "1248144986178846728", "modules": {}},
+                    {"id_str": "1000000000000000000", "modules": {}},
+                    {"id_str": "1248160448094666754", "modules": {}},
+                ],
+                "has_more": True,
+                "offset": "next",
+            },
+        }
+        with mock.patch.object(
+            collect, "_request_with_retry", return_value=FakeResponse(payload=payload)
+        ):
+            items, newest, complete = collect.fetch_dynamics("1245176397131939889")
+
+        self.assertTrue(complete)
+        self.assertEqual([item["id_str"] for item in items], ["1248144986178846728"])
+
     def test_environment_validation_lists_missing_names_without_values(self):
         patches = {
             "_R2_ACCESS_KEY": "",

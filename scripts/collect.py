@@ -419,14 +419,29 @@ def fetch_dynamics(last_id: Optional[str] = None) -> tuple[list[dict], Optional[
             pagination_complete = True
             break
 
-        # Check for last_id → stop when we hit already-processed content
+        # Check for last_id → stop when we reach already-processed content.
+        # Dynamic IDs are snowflakes (monotonic with time), so any non-pinned
+        # item with id <= last_id marks the chronological boundary. The pinned
+        # (置顶) dynamic always sits at position 0 regardless of age; when the
+        # pinned post IS the cursor, stopping on it would skip every newer
+        # item that follows — skip it instead (already archived; downstream
+        # dedup/merge handles re-collection of newer pinned posts).
         stop_early = False
         for item in items:
             item_id = item.get("id_str", "")
-            if last_id and item_id == last_id:
-                log(f"  Hit last_id={last_id[:16]} — stopping incremental fetch.")
-                stop_early = True
-                break
+            is_pinned = ((item.get("modules") or {}).get("module_tag") or {}).get("text") == "置顶"
+            if last_id:
+                try:
+                    already_processed = int(item_id) <= int(last_id)
+                except ValueError:
+                    already_processed = item_id == last_id
+                if already_processed:
+                    if is_pinned:
+                        log("  Pinned dynamic already archived — skipping it, continuing past it.")
+                        continue
+                    log(f"  Reached already-processed dynamic {item_id[:16]} — stopping incremental fetch.")
+                    stop_early = True
+                    break
             all_items.append(item)
             if newest_id is None:
                 newest_id = item_id
@@ -469,7 +484,9 @@ _TITLE_PATTERN = re.compile(r"〓[^〓\n]*[｜|][^〓\n]*〓(上新|余量上架
 SALES_INFO_RE = re.compile(r".*贩售情报.*")
 
 # 手办预售 posts (e.g. 〓明日方舟 1/7手办 XXX 预售开启!〓) are archived in the /figures section
-FIGURE_PREORDER_RE = re.compile(r".*手办.*预售")
+# (product lines vary — 1/7手办 / 粘土人 / 罗德小朋友系列 … — so match any fenced
+#  title containing 预售; checked on the title line only, after 上新 patterns)
+FIGURE_PREORDER_RE = re.compile(r".*预售")
 FIGURE_PREORDER_CATEGORY = "手办"
 
 
