@@ -309,9 +309,10 @@
     infoEl.hidden = false;
   }
 
-  // wave-1 本地链接构造：优先 Rank 2 的 window.buildDynamicLink；否则用末 8 位 base36 短码
+  // wave-1 本地链接构造：优先 Rank 2 的 window.buildDynamicLink；否则 dyn.code → 末 8 位 base36
   function viewerLink(dyn) {
     if (typeof window.buildDynamicLink === "function") return window.buildDynamicLink(dyn);
+    if (dyn && dyn.code) return location.origin + "/to/" + dyn.code + "/";
     var code = "";
     try { code = BigInt(dyn.id).toString(36).slice(-8); } catch (e) { code = String(dyn.id || ""); }
     return location.origin + "/to/" + code + "/";

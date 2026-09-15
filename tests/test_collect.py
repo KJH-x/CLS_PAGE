@@ -494,6 +494,46 @@ class CollectTests(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual([item["id_str"] for item in items], ["1248144986178846728"])
 
+    def test_share_codes_four_char_with_collision_escape(self):
+        dynamics = [{"id": "1248144986178846728"}, {"id": "1245655084157632520"}, {"id": "1231817382409797649"}]
+        codes = collect.assign_share_codes("cls", dynamics)
+
+        self.assertEqual(len(codes), 3)
+        self.assertEqual(len({*codes.values()}), 3)
+        for code in codes.values():
+            self.assertLessEqual(len(code), 8)
+            self.assertTrue(all(ch in collect._SHARE_ALPHABET for ch in code))
+
+    def test_share_codes_engineered_collision_escapes_to_eight(self):
+        # Force BOTH ids onto the same 4-char candidate to manufacture a collision.
+        real = collect._candidate4
+        def fake(account, dyn_id):
+            if dyn_id in ("1245655084157632520", "1248144986178846728"):
+                return "ab12"
+            return real(account, dyn_id)
+        with mock.patch.object(collect, "_candidate4", fake):
+            codes = collect.assign_share_codes(
+                "cls",
+                [{"id": "1248144986178846728"}, {"id": "1245655084157632520"}],
+            )
+
+        # Ascending order: the smaller ID claims the 4-char candidate first and
+        # keeps it forever; the larger (later) colliding ID escapes to tail-8.
+        self.assertEqual(codes["1245655084157632520"], "ab12")
+        self.assertEqual(codes["1248144986178846728"], collect.base36_tail("1248144986178846728", 8))
+        self.assertEqual(len(codes["1248144986178846728"]), 8)
+
+    def test_share_codes_stable_when_new_ids_added(self):
+        base = [{"id": "1143870595506634771"}, {"id": "1206640973425147926"}]
+        before = collect.assign_share_codes("cls", base)
+        after = collect.assign_share_codes("cls", base + [{"id": "1248144986178846728"}])
+        for dyn in base:
+            self.assertEqual(before[dyn["id"]], after[dyn["id"]])
+
+    def test_share_codes_cross_account_pools_are_disjoint(self):
+        self.assertTrue(set(collect._SHARE_FIRST["cls"]).isdisjoint(collect._SHARE_FIRST["endfield"]))
+        self.assertEqual(len(collect._SHARE_FIRST["cls"]) + len(collect._SHARE_FIRST["endfield"]), 36)
+
     def test_environment_validation_lists_missing_names_without_values(self):
         patches = {
             "_R2_ACCESS_KEY": "",

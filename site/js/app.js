@@ -434,7 +434,8 @@
   }
 
   function buildDynamicLink(dyn) {
-    return window.location.origin + "/to/" + shortCode((dyn && dyn.id) || "") + "/";
+    var code = (dyn && dyn.code) || shortCode((dyn && dyn.id) || "");
+    return window.location.origin + "/to/" + code + "/";
   }
 
   function copyTextFallback(text) {
@@ -481,9 +482,10 @@
   function matchTarget(dyn, target) {
     if (target.id) return dyn.id === target.id;
     if (target.slug) {
+      if (dyn.code && dyn.code === target.slug) return true;  // 服务端 4/8 位短码
       if (dyn.slug && dyn.slug === target.slug) return true;  // 服务端权威值直接比对
       if (buildSlug(dyn) === target.slug) return true;        // 旧索引回退：客户端推导
-      if (shortCode(dyn.id) === target.slug) return true;     // /to/{短码}/
+      if (shortCode(dyn.id) === target.slug) return true;     // /to/{8位短码}/（旧分享链）
       return dyn.id === target.slug;                          // 兜底：完整动态 ID
     }
     return false;

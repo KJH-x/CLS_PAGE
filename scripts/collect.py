@@ -799,6 +799,59 @@ def server_slug(text: str, full_text: str, dyn_id: str) -> str:
     return str(dyn_id or "")
 
 
+# ---------------------------------------------------------------------------
+# Variable-length share codes (UTF-8 style): most dynamics get a 4-char code,
+# tail-4 collisions escape to 8 chars. Assigned by collect.py (server
+# authority) and frozen into index.json as `code`; the client copies
+# dyn.code and resolves /to/{token}/ by matching the stored code first.
+# ---------------------------------------------------------------------------
+
+_SHARE_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+# ak (cls) and ef (endfield) claim disjoint first-char pools so 4-char codes
+# can never collide across accounts (one collect.py run only sees its own
+# account). Each pool: 18 x 36^3 = 839,808 candidates.
+_SHARE_FIRST = {"cls": _SHARE_ALPHABET[:18], "endfield": _SHARE_ALPHABET[18:]}
+
+
+def base36_tail(dyn_id: str, k: int) -> str:
+    """Last k chars of the dynamic ID's base36 form (bijective truncation)."""
+    n = int(dyn_id)
+    out = []
+    while n:
+        n, r = divmod(n, 36)
+        out.append(_SHARE_ALPHABET[r])
+    s = "".join(reversed(out)) or "0"
+    return s[-k:] if len(s) > k else s
+
+
+def _candidate4(account: str, dyn_id: str) -> str:
+    """Uniform 4-char code candidate inside the account's first-char pool."""
+    pool = _SHARE_FIRST[account]
+    digest = hashlib.sha256(f"{account}:{dyn_id}".encode("utf-8")).digest()
+    first = pool[int.from_bytes(digest[0:4], "big") % len(pool)]
+    rest = base36_tail(str(int.from_bytes(digest[4:8], "big")), 3)
+    return first + rest
+
+
+def assign_share_codes(account: str, dynamics: list[dict]) -> dict[str, str]:
+    """Deterministic code assignment over one account's full ID set.
+
+    IDs are processed ascending; the first claimant of a 4-char candidate
+    keeps it forever, later collisions escape to their own 8-char base36
+    tail. Append-only growth (new dynamics have larger IDs) therefore never
+    reassigns an existing code, so already-shared links stay valid."""
+    codes: dict[str, str] = {}
+    claimed: dict[str, str] = {}
+    for dyn_id in sorted({d["id"] for d in dynamics}):
+        c4 = _candidate4(account, dyn_id)
+        if c4 in claimed:
+            codes[dyn_id] = base36_tail(dyn_id, 8)
+        else:
+            claimed[c4] = dyn_id
+            codes[dyn_id] = c4
+    return codes
+
+
 def make_dyn_entry(dyn: dict, images: list[dict]) -> dict:
     """Build the persisted index entry for one dynamic.
 
@@ -816,6 +869,7 @@ def make_dyn_entry(dyn: dict, images: list[dict]) -> dict:
         "category": dyn.get("category", ""),
         "imageCount": len(images),
         "slug": server_slug(dyn.get("text", ""), dyn.get("fullText", ""), dyn.get("id", "")),
+        "code": dyn.get("code", ""),
         "images": images,
     }
 
@@ -1129,6 +1183,9 @@ def main() -> None:
     main_selected = [d for d in deduped if d.get("category") != figure_category][:_KEEP_RECENT]
     figure_selected = [d for d in deduped if d.get("category") == figure_category]
     selected = main_selected + figure_selected
+    share_codes = assign_share_codes(_ARCHIVE_MODE, selected)
+    for d in selected:
+        d["code"] = share_codes.get(d["id"], "")
     log(f"  Newly extracted: {len(candidates)}, merged from old index: {merged_from_old}")
     log(f"  Selected (top {_KEEP_RECENT} main + all figures): {len(main_selected)} main, {len(figure_selected)} figures")
 
